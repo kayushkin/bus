@@ -3,6 +3,7 @@ package hub
 import (
 	"encoding/json"
 	"log"
+	"strings"
 	"sync"
 
 	"github.com/kayushkin/bus/store"
@@ -42,7 +43,7 @@ func (h *Hub) Publish(topic string, payload json.RawMessage, source string) (*st
 	defer h.mu.RUnlock()
 
 	for sub := range h.subscribers {
-		if sub.Topics[topic] || sub.Topics["*"] {
+		if matchTopics(sub.Topics, topic) {
 			select {
 			case sub.Send <- msg:
 			default:
@@ -91,8 +92,8 @@ func (h *Hub) Unsubscribe(sub *Subscriber) {
 // Used on reconnect to deliver missed messages.
 func (h *Hub) CatchUp(sub *Subscriber, fromID int64) error {
 	for topic := range sub.Topics {
-		if topic == "*" {
-			// Wildcard: catch up on all topics? Skip for now.
+		if topic == "*" || strings.HasSuffix(topic, ".*") {
+			// Wildcard catch-up not yet supported (would need topic enumeration).
 			continue
 		}
 		msgs, err := h.store.Since(topic, fromID, 1000)
@@ -108,6 +109,26 @@ func (h *Hub) CatchUp(sub *Subscriber, fromID int64) error {
 		}
 	}
 	return nil
+}
+
+// matchTopics checks if any subscription pattern matches the topic.
+// Supports exact match, "*" (all), and "prefix.*" (prefix wildcard).
+func matchTopics(patterns map[string]bool, topic string) bool {
+	if patterns["*"] {
+		return true
+	}
+	if patterns[topic] {
+		return true
+	}
+	for p := range patterns {
+		if strings.HasSuffix(p, ".*") {
+			prefix := strings.TrimSuffix(p, ".*")
+			if strings.HasPrefix(topic, prefix+".") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // Store returns the underlying store (for history/stats queries).
