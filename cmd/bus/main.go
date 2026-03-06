@@ -219,6 +219,17 @@ func main() {
 			}
 		}()
 
+		// Keepalive ping.
+		go func() {
+			ticker := time.NewTicker(30 * time.Second)
+			defer ticker.Stop()
+			for range ticker.C {
+				if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+					return
+				}
+			}
+		}()
+
 		// Write pump — send messages to WS client.
 		for msg := range sub.Send {
 			data, err := json.Marshal(msg)
