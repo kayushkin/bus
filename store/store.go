@@ -1,0 +1,266 @@
+package store
+
+import (
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"sync"
+	"time"
+
+	_ "github.com/mattn/go-sqlite3"
+)
+
+// Message is a single bus message.
+type Message struct {
+	ID        int64           `json:"id"`
+	Topic     string          `json:"topic"`
+	Payload   json.RawMessage `json:"payload"`
+	Source    string          `json:"source,omitempty"`
+	CreatedAt time.Time       `json:"created_at"`
+}
+
+// Store handles SQLite-backed message persistence.
+type Store struct {
+	db *sql.DB
+	mu sync.RWMutex
+}
+
+// New opens or creates a SQLite database.
+func New(path string) (*Store, error) {
+	db, err := sql.Open("sqlite3", path+"?_journal_mode=WAL&_busy_timeout=5000&_synchronous=NORMAL")
+	if err != nil {
+		return nil, fmt.Errorf("open db: %w", err)
+	}
+
+	if err := migrate(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate: %w", err)
+	}
+
+	return &Store{db: db}, nil
+}
+
+func migrate(db *sql.DB) error {
+	_, err := db.Exec(`
+		CREATE TABLE IF NOT EXISTS messages (
+			id         INTEGER PRIMARY KEY AUTOINCREMENT,
+			topic      TEXT    NOT NULL,
+			payload    TEXT    NOT NULL,
+			source     TEXT    NOT NULL DEFAULT '',
+			created_at TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+		);
+
+		CREATE INDEX IF NOT EXISTS idx_messages_topic ON messages(topic);
+		CREATE INDEX IF NOT EXISTS idx_messages_topic_id ON messages(topic, id);
+
+		CREATE TABLE IF NOT EXISTS consumers (
+			consumer_id TEXT NOT NULL,
+			topic       TEXT NOT NULL,
+			last_ack_id INTEGER NOT NULL DEFAULT 0,
+			updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+			PRIMARY KEY (consumer_id, topic)
+		);
+	`)
+	return err
+}
+
+// Publish inserts a message and returns its ID.
+func (s *Store) Publish(topic string, payload json.RawMessage, source string) (*Message, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	res, err := s.db.Exec(
+		`INSERT INTO messages (topic, payload, source) VALUES (?, ?, ?)`,
+		topic, string(payload), source,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("insert: %w", err)
+	}
+
+	id, _ := res.LastInsertId()
+
+	msg := &Message{
+		ID:        id,
+		Topic:     topic,
+		Payload:   payload,
+		Source:    source,
+		CreatedAt: time.Now().UTC(),
+	}
+	return msg, nil
+}
+
+// Since returns messages on a topic after the given ID.
+func (s *Store) Since(topic string, afterID int64, limit int) ([]Message, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if limit <= 0 {
+		limit = 100
+	}
+
+	rows, err := s.db.Query(
+		`SELECT id, topic, payload, source, created_at FROM messages
+		 WHERE topic = ? AND id > ? ORDER BY id ASC LIMIT ?`,
+		topic, afterID, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	return scanMessages(rows)
+}
+
+// History returns the most recent messages on a topic.
+func (s *Store) History(topic string, limit int) ([]Message, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if limit <= 0 {
+		limit = 50
+	}
+
+	rows, err := s.db.Query(
+		`SELECT id, topic, payload, source, created_at FROM messages
+		 WHERE topic = ? ORDER BY id DESC LIMIT ?`,
+		topic, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	msgs, err := scanMessages(rows)
+	if err != nil {
+		return nil, err
+	}
+
+	// Reverse to chronological order.
+	for i, j := 0, len(msgs)-1; i < j; i, j = i+1, j-1 {
+		msgs[i], msgs[j] = msgs[j], msgs[i]
+	}
+	return msgs, nil
+}
+
+// Ack records that a consumer has processed up to messageID on a topic.
+func (s *Store) Ack(consumerID, topic string, messageID int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, err := s.db.Exec(
+		`INSERT INTO consumers (consumer_id, topic, last_ack_id, updated_at)
+		 VALUES (?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+		 ON CONFLICT(consumer_id, topic) DO UPDATE SET
+		   last_ack_id = MAX(last_ack_id, excluded.last_ack_id),
+		   updated_at = excluded.updated_at`,
+		consumerID, topic, messageID,
+	)
+	return err
+}
+
+// LastAck returns the last acknowledged message ID for a consumer on a topic.
+func (s *Store) LastAck(consumerID, topic string) (int64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var id int64
+	err := s.db.QueryRow(
+		`SELECT last_ack_id FROM consumers WHERE consumer_id = ? AND topic = ?`,
+		consumerID, topic,
+	).Scan(&id)
+	if err == sql.ErrNoRows {
+		return 0, nil
+	}
+	return id, err
+}
+
+// Compact removes messages that all registered consumers have acknowledged.
+func (s *Store) Compact() (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Find the minimum ack across all consumers per topic, delete below that.
+	res, err := s.db.Exec(`
+		DELETE FROM messages WHERE id IN (
+			SELECT m.id FROM messages m
+			INNER JOIN (
+				SELECT topic, MIN(last_ack_id) as min_ack
+				FROM consumers
+				GROUP BY topic
+			) c ON m.topic = c.topic AND m.id <= c.min_ack
+		)
+	`)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// Stats returns basic bus statistics.
+func (s *Store) Stats() (map[string]interface{}, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	stats := make(map[string]interface{})
+
+	var total int64
+	s.db.QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&total)
+	stats["total_messages"] = total
+
+	rows, err := s.db.Query(`SELECT topic, COUNT(*) FROM messages GROUP BY topic`)
+	if err != nil {
+		return stats, err
+	}
+	defer rows.Close()
+
+	topics := make(map[string]int64)
+	for rows.Next() {
+		var topic string
+		var count int64
+		rows.Scan(&topic, &count)
+		topics[topic] = count
+	}
+	stats["topics"] = topics
+
+	cRows, err := s.db.Query(`SELECT consumer_id, topic, last_ack_id FROM consumers`)
+	if err != nil {
+		return stats, err
+	}
+	defer cRows.Close()
+
+	consumers := make([]map[string]interface{}, 0)
+	for cRows.Next() {
+		var cid, topic string
+		var lastAck int64
+		cRows.Scan(&cid, &topic, &lastAck)
+		consumers = append(consumers, map[string]interface{}{
+			"consumer_id": cid,
+			"topic":       topic,
+			"last_ack_id": lastAck,
+		})
+	}
+	stats["consumers"] = consumers
+
+	return stats, nil
+}
+
+// Close closes the database.
+func (s *Store) Close() error {
+	return s.db.Close()
+}
+
+func scanMessages(rows *sql.Rows) ([]Message, error) {
+	var msgs []Message
+	for rows.Next() {
+		var m Message
+		var payload string
+		var createdAt string
+		if err := rows.Scan(&m.ID, &m.Topic, &payload, &m.Source, &createdAt); err != nil {
+			return nil, err
+		}
+		m.Payload = json.RawMessage(payload)
+		m.CreatedAt, _ = time.Parse("2006-01-02T15:04:05.000Z", createdAt)
+		msgs = append(msgs, m)
+	}
+	return msgs, rows.Err()
+}
