@@ -1,6 +1,9 @@
 // bus-agent subscribes to the bus for inbound messages,
-// runs inber locally, and publishes responses back.
-// Replaces tunnel-client.
+// calls inber locally, and publishes responses back.
+//
+// Si publishes all adapter messages to "inbound" with channel metadata.
+// Bus-agent determines the right agent from channel config, calls inber,
+// publishes the response to "outbound" with the original channel info.
 package main
 
 import (
@@ -30,19 +33,30 @@ type busMessage struct {
 }
 
 type siMessage struct {
-	Text    string `json:"text"`
-	Author  string `json:"author,omitempty"`
-	Agent   string `json:"agent,omitempty"`
-	Channel string `json:"channel,omitempty"`
+	ID        string    `json:"id,omitempty"`
+	Text      string    `json:"text"`
+	Author    string    `json:"author,omitempty"`
+	Agent     string    `json:"agent,omitempty"`
+	Channel   string    `json:"channel,omitempty"`
+	ReplyTo   string    `json:"reply_to,omitempty"`
+	MediaURL  string    `json:"media_url,omitempty"`
+	Timestamp time.Time `json:"timestamp"`
+}
+
+// channelRoute maps a channel pattern to an agent name.
+type channelRoute struct {
+	Prefix string `json:"prefix"` // e.g. "discord:", "websocket"
+	Agent  string `json:"agent"`  // e.g. "claxon", "bran"
 }
 
 func main() {
-	busURL := flag.String("bus", envOr("BUS_URL", "https://kayushkin.com/bus"), "bus URL")
+	busURL := flag.String("bus", envOr("BUS_URL", "http://localhost:8100"), "bus URL")
 	token := flag.String("token", envOr("BUS_TOKEN", ""), "bus auth token")
 	consumer := flag.String("consumer", envOr("BUS_CONSUMER", "bus-agent-wsl"), "consumer ID")
 	inberBin := flag.String("inber", envOr("INBER_BIN", os.ExpandEnv("$HOME/bin/inber")), "inber binary path")
 	inberDir := flag.String("dir", envOr("INBER_DIR", os.ExpandEnv("$HOME/life/repos/inber")), "inber working directory")
-	topics := flag.String("topics", envOr("BUS_TOPICS", "inbound.*,inbound.default"), "topics to subscribe to")
+	defaultAgent := flag.String("agent", envOr("BUS_DEFAULT_AGENT", "claxon"), "default agent")
+	routesFile := flag.String("routes", envOr("BUS_ROUTES", ""), "channel routes JSON file (optional)")
 	flag.Parse()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -56,28 +70,53 @@ func main() {
 		cancel()
 	}()
 
+	// Load channel → agent routes.
+	var routes []channelRoute
+	if *routesFile != "" {
+		data, err := os.ReadFile(*routesFile)
+		if err != nil {
+			log.Fatalf("[bus-agent] failed to read routes file: %v", err)
+		}
+		if err := json.Unmarshal(data, &routes); err != nil {
+			log.Fatalf("[bus-agent] failed to parse routes: %v", err)
+		}
+		log.Printf("[bus-agent] loaded %d channel routes", len(routes))
+	}
+
 	agent := &Agent{
-		busURL:   *busURL,
-		token:    *token,
-		consumer: *consumer,
-		inberBin: *inberBin,
-		inberDir: *inberDir,
-		topics:   strings.Split(*topics, ","),
-		http:     &http.Client{Timeout: 10 * time.Second},
+		busURL:       *busURL,
+		token:        *token,
+		consumer:     *consumer,
+		inberBin:     *inberBin,
+		inberDir:     *inberDir,
+		defaultAgent: *defaultAgent,
+		routes:       routes,
+		http:         &http.Client{Timeout: 10 * time.Second},
 	}
 
 	agent.Run(ctx)
 }
 
 type Agent struct {
-	busURL   string
-	token    string
-	consumer string
-	inberBin string
-	inberDir string
-	topics   []string
-	http     *http.Client
-	mu       sync.Mutex
+	busURL       string
+	token        string
+	consumer     string
+	inberBin     string
+	inberDir     string
+	defaultAgent string
+	routes       []channelRoute
+	http         *http.Client
+	mu           sync.Mutex // serialize inber calls per agent
+}
+
+// resolveAgent maps a channel to an agent name using configured routes.
+func (a *Agent) resolveAgent(channel string) string {
+	for _, r := range a.routes {
+		if strings.HasPrefix(channel, r.Prefix) || channel == r.Prefix {
+			return r.Agent
+		}
+	}
+	return a.defaultAgent
 }
 
 func (a *Agent) Run(ctx context.Context) {
@@ -103,8 +142,8 @@ func (a *Agent) subscribe(ctx context.Context) error {
 	wsURL := strings.Replace(a.busURL, "https://", "wss://", 1)
 	wsURL = strings.Replace(wsURL, "http://", "ws://", 1)
 
-	url := fmt.Sprintf("%s/subscribe?consumer=%s&topics=%s&token=%s",
-		wsURL, a.consumer, strings.Join(a.topics, ","), a.token)
+	url := fmt.Sprintf("%s/subscribe?consumer=%s&topics=inbound&token=%s",
+		wsURL, a.consumer, a.token)
 
 	log.Printf("[bus-agent] connecting to %s...", a.busURL)
 	conn, _, err := websocket.DefaultDialer.Dial(url, nil)
@@ -112,7 +151,7 @@ func (a *Agent) subscribe(ctx context.Context) error {
 		return err
 	}
 	defer conn.Close()
-	log.Printf("[bus-agent] subscribed to %v", a.topics)
+	log.Printf("[bus-agent] subscribed to inbound")
 
 	for {
 		select {
@@ -139,32 +178,26 @@ func (a *Agent) subscribe(ctx context.Context) error {
 			continue
 		}
 
-		log.Printf("[bus-agent] received: %s", truncate(siMsg.Text, 80))
+		log.Printf("[bus-agent] ← [%s] %s: %s",
+			siMsg.Channel, siMsg.Author, truncate(siMsg.Text, 80))
 
-		// Process async.
-		go func(m siMessage, busID int64, topic string) {
-			resp := a.processWithInber(ctx, m)
-			a.publish(resp)
-			a.ack(topic, busID)
-		}(siMsg, msg.ID, msg.Topic)
+		// Process synchronously to avoid concurrent inber sessions.
+		// TODO: per-agent goroutines with queues for concurrency.
+		resp := a.processWithInber(ctx, siMsg)
+		a.publish(resp)
+		a.ack(msg.Topic, msg.ID)
 	}
 }
 
 func (a *Agent) processWithInber(ctx context.Context, msg siMessage) siMessage {
-	// Build context prefix.
-	contextPrefix := ""
-	if msg.Channel != "" {
-		contextPrefix = "[from " + msg.Channel
-		if msg.Author != "" {
-			contextPrefix += " by " + msg.Author
-		}
-		contextPrefix += "] "
-	}
+	agent := a.resolveAgent(msg.Channel)
 
-	agent := msg.Agent
-	args := []string{"run"}
-	if agent != "" {
-		args = append(args, "--agent", agent)
+	args := []string{"run", "-a", agent}
+
+	// Format input with metadata so the agent knows who's talking.
+	input := msg.Text
+	if msg.Author != "" {
+		input = fmt.Sprintf("[%s] %s", msg.Author, msg.Text)
 	}
 
 	cmdCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
@@ -186,10 +219,9 @@ func (a *Agent) processWithInber(ctx context.Context, msg siMessage) siMessage {
 	stderr, _ := cmd.StderrPipe()
 
 	if err := cmd.Start(); err != nil {
-		return siMessage{Text: "error: " + err.Error(), Channel: msg.Channel}
+		return siMessage{Text: "error starting inber: " + err.Error(), Channel: msg.Channel}
 	}
 
-	input := contextPrefix + msg.Text
 	stdin.Write([]byte(input))
 	stdin.Close()
 
@@ -197,30 +229,25 @@ func (a *Agent) processWithInber(ctx context.Context, msg siMessage) siMessage {
 	errData, _ := io.ReadAll(stderr)
 	cmd.Wait()
 
-	response := siMessage{
-		Text:    string(output),
-		Channel: msg.Channel,
-		Author:  agent,
-		Agent:   agent,
+	text := strings.TrimSpace(string(output))
+	if text == "" && len(errData) > 0 {
+		text = strings.TrimSpace(string(errData))
 	}
 
-	if len(output) == 0 && len(errData) > 0 {
-		response.Text = string(errData)
-	}
+	log.Printf("[bus-agent] → [%s] %s: %s", msg.Channel, agent, truncate(text, 80))
 
-	log.Printf("[bus-agent] response: %s", truncate(response.Text, 80))
-	return response
+	return siMessage{
+		Text:      text,
+		Channel:   msg.Channel,
+		Author:    agent,
+		Timestamp: time.Now(),
+	}
 }
 
 func (a *Agent) publish(msg siMessage) {
-	topic := "outbound." + msg.Agent
-	if msg.Agent == "" {
-		topic = "outbound.default"
-	}
-
 	payload, _ := json.Marshal(msg)
 	body := map[string]interface{}{
-		"topic":   topic,
+		"topic":   "outbound",
 		"payload": json.RawMessage(payload),
 		"source":  "bus-agent",
 	}

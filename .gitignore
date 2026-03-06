@@ -2,3 +2,5 @@
 *.db
 /bus-linux
 /bus-agent
+bus-agent
+bus
