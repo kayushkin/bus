@@ -172,7 +172,8 @@ func (b *CLIBackend) Run(ctx context.Context, agent string, msg siMessage, injec
 		stdinPipe.Close()
 	}
 
-	output, _ := io.ReadAll(stdout)
+	rawOutput, _ := io.ReadAll(stdout)
+	output := stripANSI(rawOutput)
 	errData, _ := io.ReadAll(stderrPipe)
 
 	if b.inject {
@@ -561,6 +562,29 @@ func writeJSON(w io.Writer, text, author string) error {
 
 func replaceVars(s, agent string) string {
 	return strings.ReplaceAll(s, "{agent}", agent)
+}
+
+// stripANSI removes ANSI escape sequences from output.
+func stripANSI(b []byte) []byte {
+	result := make([]byte, 0, len(b))
+	i := 0
+	for i < len(b) {
+		if b[i] == 0x1b && i+1 < len(b) && b[i+1] == '[' {
+			// Skip CSI sequence: ESC [ ... final byte (0x40-0x7E)
+			j := i + 2
+			for j < len(b) && (b[j] < 0x40 || b[j] > 0x7E) {
+				j++
+			}
+			if j < len(b) {
+				j++ // skip final byte
+			}
+			i = j
+		} else {
+			result = append(result, b[i])
+			i++
+		}
+	}
+	return result
 }
 
 func expandHome(path string) string {

@@ -372,6 +372,7 @@ func (ba *BusAgent) runQueue(q *agentQueue) {
 
 			// Route spawn requests to target agent queues.
 			for _, s := range spawns {
+				s.Agent = strings.ToLower(s.Agent) // normalize — registry is source of truth
 				tq := ba.getOrCreateQueue(s.Agent)
 				tq.ch <- agentTask{
 					msg: siMessage{
@@ -486,7 +487,8 @@ func (ba *BusAgent) subscribe() error {
 
 		// Route to agent queue, or inject into running process.
 		// Message-level agent takes priority over channel-based routing.
-		agentName := siMsg.Agent
+		// Normalize to lowercase — registry is the source of truth for names.
+		agentName := strings.ToLower(siMsg.Agent)
 		if agentName == "" {
 			agentName = ba.resolveAgent(siMsg.Channel)
 		}
