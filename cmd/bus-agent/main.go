@@ -89,15 +89,16 @@ type busMessage struct {
 }
 
 type siMessage struct {
-	ID        string       `json:"id,omitempty"`
-	Text      string       `json:"text"`
-	Author    string       `json:"author,omitempty"`
-	Agent     string       `json:"agent,omitempty"`
-	Channel   string       `json:"channel,omitempty"`
-	ReplyTo   string       `json:"reply_to,omitempty"`
-	MediaURL  string       `json:"media_url,omitempty"`
-	Timestamp time.Time    `json:"timestamp"`
-	Meta      *messageMeta `json:"meta,omitempty"`
+	ID           string       `json:"id,omitempty"`
+	Text         string       `json:"text"`
+	Author       string       `json:"author,omitempty"`
+	Agent        string       `json:"agent,omitempty"`
+	Orchestrator string       `json:"orchestrator,omitempty"`
+	Channel      string       `json:"channel,omitempty"`
+	ReplyTo      string       `json:"reply_to,omitempty"`
+	MediaURL     string       `json:"media_url,omitempty"`
+	Timestamp    time.Time    `json:"timestamp"`
+	Meta         *messageMeta `json:"meta,omitempty"`
 }
 
 type messageMeta struct {
@@ -243,7 +244,7 @@ func main() {
 
 	// Seed registry from config (only adds agents not already in DB).
 	for name, orch := range cfg.Agents {
-		if _, err := registry.Get(name); err != nil {
+		if _, err := registry.Get(name, orch); err != nil {
 			registry.Set(AgentEntry{Name: name, Orchestrator: orch, Enabled: true})
 			log.Printf("[bus-agent] seeded agent %q → %s", name, orch)
 		}
@@ -506,8 +507,7 @@ func (ba *BusAgent) subscribe() error {
 		q.mu.Unlock()
 
 		if !injected {
-			q.ch <- agentTask{msg: siMsg}
-			// orchestrator resolved later in runQueue via resolveBackend (registry lookup)
+			q.ch <- agentTask{msg: siMsg, orchestrator: siMsg.Orchestrator}
 		}
 
 		ba.ack(msg.Topic, msg.ID)
@@ -711,16 +711,17 @@ func (ba *BusAgent) handleAgents(w http.ResponseWriter, r *http.Request) {
 
 	case http.MethodDelete:
 		name := r.URL.Query().Get("name")
-		if name == "" {
-			http.Error(w, `{"error":"name query param required"}`, http.StatusBadRequest)
+		orchestrator := r.URL.Query().Get("orchestrator")
+		if name == "" || orchestrator == "" {
+			http.Error(w, `{"error":"name and orchestrator query params required"}`, http.StatusBadRequest)
 			return
 		}
-		if err := ba.registry.Delete(name); err != nil {
+		if err := ba.registry.Delete(name, orchestrator); err != nil {
 			http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusNotFound)
 			return
 		}
-		log.Printf("[bus-agent] removed agent %q", name)
-		json.NewEncoder(w).Encode(map[string]string{"ok": "true", "deleted": name})
+		log.Printf("[bus-agent] removed agent %q/%s", name, orchestrator)
+		json.NewEncoder(w).Encode(map[string]string{"ok": "true", "deleted": name, "orchestrator": orchestrator})
 
 	default:
 		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
