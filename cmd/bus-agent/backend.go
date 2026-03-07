@@ -416,10 +416,12 @@ func (b *OpenAIBackend) Run(ctx context.Context, agent string, msg siMessage, _ 
 	b.appendMessage(key, openaiChatMessage{Role: "assistant", Content: text})
 
 	meta := &messageMeta{
-		DurationMs:   duration.Milliseconds(),
-		Model:        result.Model,
-		InputTokens:  result.Usage.PromptTokens,
-		OutputTokens: result.Usage.CompletionTokens,
+		DurationMs:          duration.Milliseconds(),
+		Model:               result.Model,
+		InputTokens:         result.Usage.PromptTokens,
+		OutputTokens:        result.Usage.CompletionTokens,
+		CacheReadTokens:     result.Usage.CacheReadTokens,
+		CacheCreationTokens: result.Usage.CacheCreationTokens,
 	}
 
 	log.Printf("[%s] → [%s] %s: %s (%.1fs, %d msgs in history)",
@@ -448,9 +450,11 @@ type openaiChatCompletion struct {
 		FinishReason string            `json:"finish_reason"`
 	} `json:"choices"`
 	Usage struct {
-		PromptTokens     int `json:"prompt_tokens"`
-		CompletionTokens int `json:"completion_tokens"`
-		TotalTokens      int `json:"total_tokens"`
+		PromptTokens        int `json:"prompt_tokens"`
+		CompletionTokens    int `json:"completion_tokens"`
+		TotalTokens         int `json:"total_tokens"`
+		CacheReadTokens     int `json:"cache_read_tokens"`
+		CacheCreationTokens int `json:"cache_creation_tokens"`
 	} `json:"usage"`
 }
 
