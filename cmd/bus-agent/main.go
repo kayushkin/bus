@@ -33,14 +33,28 @@ type busMessage struct {
 }
 
 type siMessage struct {
-	ID        string    `json:"id,omitempty"`
-	Text      string    `json:"text"`
-	Author    string    `json:"author,omitempty"`
-	Agent     string    `json:"agent,omitempty"`
-	Channel   string    `json:"channel,omitempty"`
-	ReplyTo   string    `json:"reply_to,omitempty"`
-	MediaURL  string    `json:"media_url,omitempty"`
-	Timestamp time.Time `json:"timestamp"`
+	ID        string       `json:"id,omitempty"`
+	Text      string       `json:"text"`
+	Author    string       `json:"author,omitempty"`
+	Agent     string       `json:"agent,omitempty"`
+	Channel   string       `json:"channel,omitempty"`
+	ReplyTo   string       `json:"reply_to,omitempty"`
+	MediaURL  string       `json:"media_url,omitempty"`
+	Timestamp time.Time    `json:"timestamp"`
+	Meta      *messageMeta `json:"meta,omitempty"`
+}
+
+// messageMeta holds stats parsed from inber's stderr output.
+type messageMeta struct {
+	InputTokens         int     `json:"input_tokens,omitempty"`
+	OutputTokens        int     `json:"output_tokens,omitempty"`
+	CacheReadTokens     int     `json:"cache_read_tokens,omitempty"`
+	CacheCreationTokens int     `json:"cache_creation_tokens,omitempty"`
+	ToolCalls           int     `json:"tool_calls,omitempty"`
+	Cost                float64 `json:"cost,omitempty"`
+	DurationMs          int64   `json:"duration_ms,omitempty"`
+	Model               string  `json:"model,omitempty"`
+	Turn                int     `json:"turn,omitempty"`
 }
 
 // channelRoute maps a channel pattern to an agent name.
@@ -189,6 +203,63 @@ func (a *Agent) subscribe(ctx context.Context) error {
 	}
 }
 
+// parseInberMeta extracts metadata from inber's stderr output.
+// Prefers the structured INBER_META:{json} line if available,
+// falls back to parsing the box-drawing format.
+func parseInberMeta(stderr string, duration time.Duration, model string) *messageMeta {
+	lines := strings.Split(stderr, "\n")
+
+	// Try structured JSON first (INBER_META:{...})
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "INBER_META:") {
+			jsonStr := strings.TrimPrefix(line, "INBER_META:")
+			var meta messageMeta
+			if err := json.Unmarshal([]byte(jsonStr), &meta); err == nil {
+				// Override duration with our own measurement (includes process startup)
+				meta.DurationMs = duration.Milliseconds()
+				return &meta
+			}
+		}
+	}
+
+	// Fallback: parse box-drawing format
+	meta := &messageMeta{
+		DurationMs: duration.Milliseconds(),
+		Model:      model,
+	}
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+
+		if strings.HasPrefix(line, "│ in=") {
+			fmt.Sscanf(line, "│ in=%d out=%d total=%*d tools=%d",
+				&meta.InputTokens, &meta.OutputTokens, &meta.ToolCalls)
+		}
+
+		if strings.Contains(line, "│ cache:") {
+			fmt.Sscanf(line, "│ cache: %d read, %d created",
+				&meta.CacheReadTokens, &meta.CacheCreationTokens)
+		}
+
+		if strings.HasPrefix(line, "│ cost=") {
+			fmt.Sscanf(line, "│ cost=$%f", &meta.Cost)
+		}
+
+		if strings.HasPrefix(line, "model:") {
+			parts := strings.Fields(line)
+			if len(parts) >= 2 {
+				meta.Model = parts[1]
+			}
+		}
+	}
+
+	if meta.InputTokens > 0 || meta.OutputTokens > 0 || meta.Cost > 0 {
+		return meta
+	}
+	return nil
+}
+
 func (a *Agent) processWithInber(ctx context.Context, msg siMessage) siMessage {
 	agent := a.resolveAgent(msg.Channel)
 
@@ -202,6 +273,8 @@ func (a *Agent) processWithInber(ctx context.Context, msg siMessage) siMessage {
 
 	cmdCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
+
+	start := time.Now()
 
 	cmd := exec.CommandContext(cmdCtx, a.inberBin, args...)
 	cmd.Dir = a.inberDir
@@ -229,10 +302,15 @@ func (a *Agent) processWithInber(ctx context.Context, msg siMessage) siMessage {
 	errData, _ := io.ReadAll(stderr)
 	cmd.Wait()
 
+	duration := time.Since(start)
+
 	text := strings.TrimSpace(string(output))
 	if text == "" && len(errData) > 0 {
 		text = strings.TrimSpace(string(errData))
 	}
+
+	// Parse metadata from stderr
+	meta := parseInberMeta(string(errData), duration, agent)
 
 	log.Printf("[bus-agent] → [%s] %s: %s", msg.Channel, agent, truncate(text, 80))
 
@@ -241,6 +319,7 @@ func (a *Agent) processWithInber(ctx context.Context, msg siMessage) siMessage {
 		Channel:   msg.Channel,
 		Author:    agent,
 		Timestamp: time.Now(),
+		Meta:      meta,
 	}
 }
 
