@@ -202,11 +202,13 @@ func (b *CLIBackend) Run(ctx context.Context, agent string, msg siMessage, injec
 		b.name, msg.Channel, agent, truncate(text, 80), duration.Seconds())
 
 	return siMessage{
-		Text:      text,
-		Channel:   msg.Channel,
-		Author:    agent,
-		Timestamp: time.Now(),
-		Meta:      parsedMeta,
+		Text:         text,
+		Channel:      msg.Channel,
+		Agent:        agent,
+		Author:       agent,
+		Orchestrator: b.name,
+		Timestamp:    time.Now(),
+		Meta:         parsedMeta,
 	}, parsedSpawns
 }
 
@@ -274,11 +276,13 @@ func (b *HTTPBackend) Run(ctx context.Context, agent string, msg siMessage, _ <-
 		b.name, msg.Channel, agent, truncate(result.Text, 80), duration.Seconds())
 
 	return siMessage{
-		Text:      result.Text,
-		Channel:   msg.Channel,
-		Author:    agent,
-		Timestamp: time.Now(),
-		Meta:      result.Meta,
+		Text:         result.Text,
+		Channel:      msg.Channel,
+		Agent:        agent,
+		Author:       agent,
+		Orchestrator: b.name,
+		Timestamp:    time.Now(),
+		Meta:         result.Meta,
 	}, nil
 }
 
@@ -428,11 +432,13 @@ func (b *OpenAIBackend) Run(ctx context.Context, agent string, msg siMessage, _ 
 		b.name, msg.Channel, agent, truncate(text, 80), duration.Seconds(), len(history))
 
 	return siMessage{
-		Text:      text,
-		Channel:   msg.Channel,
-		Author:    agent,
-		Timestamp: time.Now(),
-		Meta:      meta,
+		Text:         text,
+		Channel:      msg.Channel,
+		Agent:        agent,
+		Author:       agent,
+		Orchestrator: b.name,
+		Timestamp:    time.Now(),
+		Meta:         meta,
 	}, nil
 }
 
