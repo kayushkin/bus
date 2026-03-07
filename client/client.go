@@ -173,6 +173,33 @@ func (s *Subscription) connect() error {
 	}
 	defer conn.Close()
 
+	// Reset read deadline when server sends pings.
+	conn.SetReadDeadline(time.Now().Add(120 * time.Second))
+	conn.SetPingHandler(func(appData string) error {
+		conn.SetReadDeadline(time.Now().Add(120 * time.Second))
+		return conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(10*time.Second))
+	})
+
+	// Client-side keepalive pings.
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-s.cancel:
+				return
+			case <-ticker.C:
+				if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(10*time.Second)); err != nil {
+					return
+				}
+			}
+		}
+	}()
+
 	for {
 		select {
 		case <-s.cancel:
@@ -180,6 +207,7 @@ func (s *Subscription) connect() error {
 		default:
 		}
 
+		conn.SetReadDeadline(time.Now().Add(120 * time.Second))
 		_, data, err := conn.ReadMessage()
 		if err != nil {
 			return err

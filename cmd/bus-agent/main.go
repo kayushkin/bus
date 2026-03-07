@@ -254,6 +254,35 @@ func (ba *BusAgent) subscribe() error {
 	defer conn.Close()
 	log.Printf("[bus-agent] subscribed to inbound")
 
+	// Reset read deadline when server pings us (gorilla handles pong reply,
+	// but ReadMessage() doesn't return for control frames so deadline isn't
+	// naturally extended during idle periods).
+	conn.SetPingHandler(func(appData string) error {
+		conn.SetReadDeadline(time.Now().Add(120 * time.Second))
+		return conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(10*time.Second))
+	})
+
+	// Client-side keepalive — detect dead tunnel faster than waiting for
+	// the full read deadline to expire.
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ba.ctx.Done():
+				return
+			case <-ticker.C:
+				if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(10*time.Second)); err != nil {
+					return
+				}
+			}
+		}
+	}()
+
 	for {
 		select {
 		case <-ba.ctx.Done():
@@ -520,6 +549,8 @@ func (ba *BusAgent) serveAPI() {
 	port := envOr("BUS_AGENT_API_PORT", "8101")
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("/api/models/test", ba.handleModelTest)
+	mux.HandleFunc("/api/models/toggle", ba.handleModelToggle)
 	mux.HandleFunc("/api/models", ba.handleModelsStatus)
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -530,6 +561,91 @@ func (ba *BusAgent) serveAPI() {
 	if err := http.ListenAndServe(":"+port, mux); err != nil {
 		log.Printf("[bus-agent] API server error: %v", err)
 	}
+}
+
+func (ba *BusAgent) handleModelTest(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Model string `json:"model"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Model == "" {
+		http.Error(w, `{"error":"model required"}`, http.StatusBadRequest)
+		return
+	}
+
+	// Run a minimal inber call to test the model
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, ba.inberBin, "run", "--raw", "--no-tools", "--new", "--detach", "-m", req.Model, "Reply with just: ok")
+	cmd.Dir = ba.inberDir
+	cmd.Env = os.Environ()
+
+	start := time.Now()
+	output, err := cmd.CombinedOutput()
+	durationMs := time.Since(start).Milliseconds()
+
+	result := map[string]interface{}{
+		"model":       req.Model,
+		"duration_ms": durationMs,
+	}
+
+	if err != nil {
+		result["status"] = "error"
+		// Extract useful error from output
+		errText := string(output)
+		if len(errText) > 200 {
+			errText = errText[len(errText)-200:]
+		}
+		result["error"] = errText
+	} else {
+		result["status"] = "ok"
+		text := strings.TrimSpace(string(output))
+		if len(text) > 100 {
+			text = text[:100]
+		}
+		result["response"] = text
+	}
+
+	json.NewEncoder(w).Encode(result)
+}
+
+func (ba *BusAgent) handleModelToggle(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Model   string `json:"model"`
+		Enabled bool   `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Model == "" {
+		http.Error(w, `{"error":"model required"}`, http.StatusBadRequest)
+		return
+	}
+
+	store, err := modelstore.Open("")
+	if err != nil {
+		http.Error(w, `{"error":"failed to open model store"}`, http.StatusInternalServerError)
+		return
+	}
+	defer store.Close()
+
+	if err := store.SetEnabled(req.Model, req.Enabled); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusBadRequest)
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "model": req.Model, "enabled": req.Enabled})
 }
 
 func (ba *BusAgent) handleModelsStatus(w http.ResponseWriter, r *http.Request) {

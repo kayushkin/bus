@@ -187,9 +187,22 @@ func main() {
 			}
 		}
 
+		// Reset read deadline when client responds to our pings.
+		conn.SetReadDeadline(time.Now().Add(120 * time.Second))
+		conn.SetPongHandler(func(string) error {
+			conn.SetReadDeadline(time.Now().Add(120 * time.Second))
+			return nil
+		})
+		// Also handle client-initiated pings (reset deadline on receipt).
+		conn.SetPingHandler(func(appData string) error {
+			conn.SetReadDeadline(time.Now().Add(120 * time.Second))
+			return conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(10*time.Second))
+		})
+
 		// Read pump — handle incoming publishes and acks from WS clients.
 		go func() {
 			for {
+				conn.SetReadDeadline(time.Now().Add(120 * time.Second))
 				_, data, err := conn.ReadMessage()
 				if err != nil {
 					return

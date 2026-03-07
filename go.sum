@@ -6,6 +6,8 @@ github.com/gorilla/websocket v1.5.3 h1:saDtZ6Pbx/0u+bgYQ3q96pZgCzfhKXGPqt7kZ72aN
 github.com/gorilla/websocket v1.5.3/go.mod h1:YR8l580nyteQvAITg2hZ9XVh4b55+EU/adAjf1fMHhE=
 github.com/kayushkin/model-store v0.0.0-20260307052626-ee701f18c642 h1:Y019UXL/+El3QOcw4ZGVSrRIb9GmsdYZQppwH5Y9M3g=
 github.com/kayushkin/model-store v0.0.0-20260307052626-ee701f18c642/go.mod h1:44Y1/UkKDMfj3dU49lDx3FHMIRG+ThrQt7HKqItjvx0=
+github.com/kayushkin/model-store v0.0.0-20260307062211-dee9db7de5bb h1:+oEWAFuavBKYMjzdsjmBN2RyPq1tPQsX/HYv149adRE=
+github.com/kayushkin/model-store v0.0.0-20260307062211-dee9db7de5bb/go.mod h1:44Y1/UkKDMfj3dU49lDx3FHMIRG+ThrQt7HKqItjvx0=
 github.com/mattn/go-isatty v0.0.20 h1:xfD0iDuEKnDkl03q4limB+vH+GxLEtL/jb4xVJSWWEY=
 github.com/mattn/go-isatty v0.0.20/go.mod h1:W+V8PltTTMOvKvAeJH7IuucS94S2C6jfK/D7dTCTo3Y=
 github.com/mattn/go-sqlite3 v1.14.34 h1:3NtcvcUnFBPsuRcno8pUtupspG/GM+9nZ88zgJcp6Zk=
