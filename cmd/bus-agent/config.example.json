@@ -8,9 +8,12 @@
       "features": ["meta", "spawns", "inject"]
     },
     "openclaw": {
-      "type": "http",
-      "url": "http://localhost:3007",
-      "token": "your-gateway-token"
+      "type": "openai",
+      "url": "http://127.0.0.1:18789",
+      "token": "${OPENCLAW_GATEWAY_TOKEN}",
+      "model": "openclaw",
+      "agent_header": "x-openclaw-agent-id",
+      "timeout": "10m"
     },
     "claude-code": {
       "type": "cli",
@@ -26,7 +29,7 @@
     }
   },
   "agents": {
-    "browser": "openclaw",
+    "oc-main": "openclaw",
     "coder": "claude-code"
   },
   "routes": [

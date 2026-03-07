@@ -21,15 +21,18 @@ type Backend interface {
 
 // BackendConfig defines a backend in the config file.
 type BackendConfig struct {
-	Type     string   `json:"type"`               // "cli" or "http"
-	Cmd      []string `json:"cmd,omitempty"`       // CLI: command template ({agent} replaced)
-	Dir      string   `json:"dir,omitempty"`       // CLI: working directory ({agent} replaced)
-	Env      []string `json:"env,omitempty"`       // CLI: extra KEY=VALUE env vars
-	Stdin    string   `json:"stdin,omitempty"`     // CLI: "json" or "text" (default "text")
-	Features []string `json:"features,omitempty"`  // CLI: ["meta", "spawns", "inject"]
-	Timeout  string   `json:"timeout,omitempty"`   // max run duration (default "10m")
-	URL      string   `json:"url,omitempty"`       // HTTP: base URL
-	Token    string   `json:"token,omitempty"`     // HTTP: auth token
+	Type        string   `json:"type"`                  // "cli", "http", or "openai"
+	Cmd         []string `json:"cmd,omitempty"`          // CLI: command template ({agent} replaced)
+	Dir         string   `json:"dir,omitempty"`          // CLI: working directory ({agent} replaced)
+	Env         []string `json:"env,omitempty"`          // CLI: extra KEY=VALUE env vars
+	Stdin       string   `json:"stdin,omitempty"`        // CLI: "json" or "text" (default "text")
+	Features    []string `json:"features,omitempty"`     // CLI: ["meta", "spawns", "inject"]
+	Timeout     string   `json:"timeout,omitempty"`      // max run duration (default "10m")
+	URL         string   `json:"url,omitempty"`          // HTTP/OpenAI: base URL
+	Token       string   `json:"token,omitempty"`        // HTTP/OpenAI: auth token
+	Model       string   `json:"model,omitempty"`        // OpenAI: model field (default "openclaw")
+	AgentHeader string   `json:"agent_header,omitempty"` // OpenAI: header for agent routing (e.g. "x-openclaw-agent-id")
+	AgentPrefix string   `json:"agent_prefix,omitempty"` // OpenAI: strip this prefix from agent name before sending
 }
 
 // NewBackend creates a Backend from config.
@@ -66,6 +69,22 @@ func NewBackend(name string, cfg BackendConfig) (Backend, error) {
 			token:   cfg.Token,
 			timeout: timeout,
 			client:  &http.Client{Timeout: timeout},
+		}, nil
+
+	case "openai":
+		model := cfg.Model
+		if model == "" {
+			model = "openclaw"
+		}
+		return &OpenAIBackend{
+			name:        name,
+			url:         cfg.URL,
+			token:       cfg.Token,
+			model:       model,
+			agentHeader: cfg.AgentHeader,
+			agentPrefix: cfg.AgentPrefix,
+			timeout:     timeout,
+			client:      &http.Client{Timeout: timeout},
 		}, nil
 
 	default:
@@ -258,6 +277,122 @@ func (b *HTTPBackend) Run(ctx context.Context, agent string, msg siMessage, _ <-
 		Timestamp: time.Now(),
 		Meta:      result.Meta,
 	}, nil
+}
+
+// --- OpenAI Backend ---
+// Speaks OpenAI Chat Completions format. Works with OpenClaw, Ollama, vLLM,
+// or any OpenAI-compatible API. Full agent runs with tools when backed by OpenClaw.
+
+type OpenAIBackend struct {
+	name        string
+	url         string // base URL (e.g., http://localhost:18789)
+	token       string // bearer token
+	model       string // model field (e.g., "openclaw")
+	agentHeader string // header for agent routing (e.g., "x-openclaw-agent-id")
+	agentPrefix string // strip this prefix before sending (e.g., "oc-")
+	timeout     time.Duration
+	client      *http.Client
+}
+
+func (b *OpenAIBackend) Run(ctx context.Context, agent string, msg siMessage, _ <-chan siMessage) (siMessage, []spawnRequest) {
+	// Strip prefix for remote agent ID (e.g., "oc-kayushkin" → "kayushkin").
+	remoteAgent := agent
+	if b.agentPrefix != "" {
+		remoteAgent = strings.TrimPrefix(agent, b.agentPrefix)
+	}
+
+	// Build OpenAI Chat Completions request.
+	content := msg.Text
+	if msg.Author != "" {
+		content = fmt.Sprintf("[%s] %s", msg.Author, msg.Text)
+	}
+
+	reqBody := struct {
+		Model    string              `json:"model"`
+		Messages []openaiChatMessage `json:"messages"`
+	}{
+		Model: b.model,
+		Messages: []openaiChatMessage{
+			{Role: "user", Content: content},
+		},
+	}
+	data, _ := json.Marshal(reqBody)
+
+	url := strings.TrimRight(b.url, "/") + "/v1/chat/completions"
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(data))
+	if err != nil {
+		return errResp(msg, err), nil
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if b.token != "" {
+		req.Header.Set("Authorization", "Bearer "+b.token)
+	}
+	if b.agentHeader != "" {
+		req.Header.Set(b.agentHeader, remoteAgent)
+	}
+
+	start := time.Now()
+	resp, err := b.client.Do(req)
+	if err != nil {
+		return errResp(msg, err), nil
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	duration := time.Since(start)
+
+	if resp.StatusCode != http.StatusOK {
+		return errResp(msg, fmt.Errorf("http %d: %s", resp.StatusCode,
+			truncate(string(body), 200))), nil
+	}
+
+	var result openaiChatCompletion
+	if err := json.Unmarshal(body, &result); err != nil {
+		return errResp(msg, fmt.Errorf("parse response: %w", err)), nil
+	}
+
+	text := ""
+	if len(result.Choices) > 0 {
+		text = result.Choices[0].Message.Content
+	}
+
+	meta := &messageMeta{
+		DurationMs:  duration.Milliseconds(),
+		Model:       result.Model,
+		InputTokens: result.Usage.PromptTokens,
+		OutputTokens: result.Usage.CompletionTokens,
+	}
+
+	log.Printf("[%s] → [%s] %s: %s (%.1fs)",
+		b.name, msg.Channel, agent, truncate(text, 80), duration.Seconds())
+
+	return siMessage{
+		Text:      text,
+		Channel:   msg.Channel,
+		Author:    agent,
+		Timestamp: time.Now(),
+		Meta:      meta,
+	}, nil
+}
+
+// OpenAI API types (minimal subset).
+type openaiChatMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+type openaiChatCompletion struct {
+	ID      string `json:"id"`
+	Model   string `json:"model"`
+	Choices []struct {
+		Message      openaiChatMessage `json:"message"`
+		FinishReason string            `json:"finish_reason"`
+	} `json:"choices"`
+	Usage struct {
+		PromptTokens     int `json:"prompt_tokens"`
+		CompletionTokens int `json:"completion_tokens"`
+		TotalTokens      int `json:"total_tokens"`
+	} `json:"usage"`
 }
 
 // --- parse helpers (used by CLIBackend) ---

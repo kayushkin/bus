@@ -167,6 +167,8 @@ func main() {
 		if err != nil {
 			log.Fatalf("[bus-agent] failed to read config: %v", err)
 		}
+		// Expand ${VAR} references in config before parsing.
+		data = []byte(os.ExpandEnv(string(data)))
 		if err := json.Unmarshal(data, &cfg); err != nil {
 			log.Fatalf("[bus-agent] failed to parse config: %v", err)
 		}
@@ -440,7 +442,11 @@ func (ba *BusAgent) subscribe() error {
 			siMsg.Channel, siMsg.Author, truncate(siMsg.Text, 80))
 
 		// Route to agent queue, or inject into running process.
-		agentName := ba.resolveAgent(siMsg.Channel)
+		// Message-level agent takes priority over channel-based routing.
+		agentName := siMsg.Agent
+		if agentName == "" {
+			agentName = ba.resolveAgent(siMsg.Channel)
+		}
 		q := ba.getOrCreateQueue(agentName)
 
 		injected := false
