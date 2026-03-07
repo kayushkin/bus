@@ -1,0 +1,38 @@
+{
+  "backends": {
+    "inber": {
+      "type": "cli",
+      "cmd": ["~/bin/inber", "run", "-a", "{agent}"],
+      "dir": "~/life/repos/inber",
+      "stdin": "json",
+      "features": ["meta", "spawns", "inject"]
+    },
+    "openclaw": {
+      "type": "http",
+      "url": "http://localhost:3007",
+      "token": "your-gateway-token"
+    },
+    "claude-code": {
+      "type": "cli",
+      "cmd": ["claude", "--print"],
+      "stdin": "text",
+      "timeout": "15m"
+    },
+    "codex": {
+      "type": "cli",
+      "cmd": ["codex", "--quiet"],
+      "stdin": "text",
+      "timeout": "15m"
+    }
+  },
+  "agents": {
+    "browser": "openclaw",
+    "coder": "claude-code"
+  },
+  "routes": [
+    {"channel": "discord", "agent": "claxon"},
+    {"channel": "dashboard", "agent": "claxon"}
+  ],
+  "default_backend": "inber",
+  "default_agent": "claxon"
+}

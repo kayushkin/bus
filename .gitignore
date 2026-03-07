@@ -1,6 +1,5 @@
-/bus
 *.db
-/bus-linux
+# Compiled binaries (not source directories)
+/bus
 /bus-agent
-bus-agent
-bus
+/bus-linux

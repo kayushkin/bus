@@ -1,5 +1,7 @@
 // bus-agent subscribes to the bus for inbound messages,
-// routes them to per-agent queues, calls inber, and publishes responses.
+// routes them to per-agent queues, dispatches to configured backends
+// (CLI tools like inber/claude-code/codex, or HTTP APIs like OpenClaw),
+// and publishes responses.
 //
 // Each agent gets its own goroutine for sequential processing.
 // Different agents run concurrently.
@@ -12,7 +14,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
@@ -25,6 +26,57 @@ import (
 	"github.com/gorilla/websocket"
 	modelstore "github.com/kayushkin/model-store"
 )
+
+// --- config ---
+
+// Config defines backends, agent→backend mappings, and channel routing.
+//
+// Example config.json:
+//
+//	{
+//	  "backends": {
+//	    "inber": {
+//	      "type": "cli",
+//	      "cmd": ["~/bin/inber", "run", "-a", "{agent}"],
+//	      "dir": "~/life/repos/inber",
+//	      "stdin": "json",
+//	      "features": ["meta", "spawns", "inject"]
+//	    },
+//	    "openclaw": {
+//	      "type": "http",
+//	      "url": "http://localhost:3007",
+//	      "token": "gateway-token"
+//	    },
+//	    "claude-code": {
+//	      "type": "cli",
+//	      "cmd": ["claude", "--print"],
+//	      "stdin": "text"
+//	    }
+//	  },
+//	  "agents": {
+//	    "browser": "openclaw",
+//	    "coder": "claude-code"
+//	  },
+//	  "routes": [
+//	    {"channel": "discord", "agent": "claxon"},
+//	    {"channel": "dashboard", "agent": "brigid"}
+//	  ],
+//	  "default_backend": "inber",
+//	  "default_agent": "claxon"
+//	}
+type Config struct {
+	Backends       map[string]BackendConfig `json:"backends"`
+	Agents         map[string]string        `json:"agents"`          // agent name → backend name
+	Routes         []RouteConfig            `json:"routes"`          // channel → agent mapping
+	DefaultBackend string                   `json:"default_backend"` // fallback backend
+	DefaultAgent   string                   `json:"default_agent"`   // fallback agent
+}
+
+type RouteConfig struct {
+	Channel string `json:"channel,omitempty"` // channel prefix match (empty = catch-all)
+	Agent   string `json:"agent,omitempty"`   // target agent name
+	Backend string `json:"backend,omitempty"` // backend override for this route
+}
 
 // --- message types ---
 
@@ -59,11 +111,6 @@ type messageMeta struct {
 	Turn                int     `json:"turn,omitempty"`
 }
 
-type channelRoute struct {
-	Prefix string `json:"prefix"`
-	Agent  string `json:"agent"`
-}
-
 type spawnRequest struct {
 	Agent string `json:"agent"`
 	Task  string `json:"task"`
@@ -79,23 +126,20 @@ type agentQueue struct {
 	name string
 	ch   chan agentTask
 
-	// Active process state — protected by mu
-	mu        sync.Mutex
-	running   bool
-	stdinPipe io.WriteCloser // open stdin of running inber process
+	mu      sync.Mutex
+	running bool
+	inject  chan siMessage // buffered channel for mid-run message injection
 }
 
 // --- bus agent ---
 
 type BusAgent struct {
-	busURL       string
-	token        string
-	consumer     string
-	inberBin     string
-	inberDir     string
-	defaultAgent string
-	routes       []channelRoute
-	http         *http.Client
+	busURL   string
+	token    string
+	consumer string
+	config   *Config
+	backends map[string]Backend
+	http     *http.Client
 
 	queues   map[string]*agentQueue
 	queuesMu sync.Mutex
@@ -107,11 +151,82 @@ func main() {
 	busURL := flag.String("bus", envOr("BUS_URL", "http://localhost:8100"), "bus URL")
 	token := flag.String("token", envOr("BUS_TOKEN", ""), "bus auth token")
 	consumer := flag.String("consumer", envOr("BUS_CONSUMER", "bus-agent-wsl"), "consumer ID")
+	configFile := flag.String("config", envOr("BUS_AGENT_CONFIG", ""), "config file path")
+
+	// Legacy flags — used when no config file is provided.
 	inberBin := flag.String("inber", envOr("INBER_BIN", os.ExpandEnv("$HOME/bin/inber")), "inber binary path")
 	inberDir := flag.String("dir", envOr("INBER_DIR", os.ExpandEnv("$HOME/life/repos/inber")), "inber working directory")
 	defaultAgent := flag.String("agent", envOr("BUS_DEFAULT_AGENT", "claxon"), "default agent")
-	routesFile := flag.String("routes", envOr("BUS_ROUTES", ""), "channel routes JSON file")
+	routesFile := flag.String("routes", envOr("BUS_ROUTES", ""), "channel routes JSON file (legacy)")
 	flag.Parse()
+
+	// Load or build config.
+	var cfg Config
+	if *configFile != "" {
+		data, err := os.ReadFile(*configFile)
+		if err != nil {
+			log.Fatalf("[bus-agent] failed to read config: %v", err)
+		}
+		if err := json.Unmarshal(data, &cfg); err != nil {
+			log.Fatalf("[bus-agent] failed to parse config: %v", err)
+		}
+		log.Printf("[bus-agent] loaded config: %d backends, %d routes", len(cfg.Backends), len(cfg.Routes))
+	} else {
+		// Build implicit config from legacy CLI flags.
+		cfg = Config{
+			Backends: map[string]BackendConfig{
+				"inber": {
+					Type:     "cli",
+					Cmd:      []string{*inberBin, "run", "-a", "{agent}"},
+					Dir:      *inberDir,
+					Stdin:    "json",
+					Features: []string{"meta", "spawns", "inject"},
+				},
+			},
+			DefaultBackend: "inber",
+			DefaultAgent:   *defaultAgent,
+		}
+
+		// Load legacy routes file.
+		if *routesFile != "" {
+			var routes []struct {
+				Prefix string `json:"prefix"`
+				Agent  string `json:"agent"`
+			}
+			data, err := os.ReadFile(*routesFile)
+			if err != nil {
+				log.Fatalf("[bus-agent] failed to read routes: %v", err)
+			}
+			if err := json.Unmarshal(data, &routes); err != nil {
+				log.Fatalf("[bus-agent] failed to parse routes: %v", err)
+			}
+			for _, r := range routes {
+				cfg.Routes = append(cfg.Routes, RouteConfig{
+					Channel: r.Prefix,
+					Agent:   r.Agent,
+				})
+			}
+			log.Printf("[bus-agent] loaded %d legacy routes", len(routes))
+		}
+	}
+
+	if cfg.Agents == nil {
+		cfg.Agents = make(map[string]string)
+	}
+
+	// Initialize backends.
+	backends := make(map[string]Backend)
+	for name, bcfg := range cfg.Backends {
+		b, err := NewBackend(name, bcfg)
+		if err != nil {
+			log.Fatalf("[bus-agent] failed to create backend %q: %v", name, err)
+		}
+		backends[name] = b
+		log.Printf("[bus-agent] backend %q (%s) ready", name, bcfg.Type)
+	}
+	if _, ok := backends[cfg.DefaultBackend]; !ok {
+		log.Fatalf("[bus-agent] default backend %q not found in config", cfg.DefaultBackend)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -124,50 +239,48 @@ func main() {
 		cancel()
 	}()
 
-	var routes []channelRoute
-	if *routesFile != "" {
-		data, err := os.ReadFile(*routesFile)
-		if err != nil {
-			log.Fatalf("[bus-agent] failed to read routes file: %v", err)
-		}
-		if err := json.Unmarshal(data, &routes); err != nil {
-			log.Fatalf("[bus-agent] failed to parse routes: %v", err)
-		}
-		log.Printf("[bus-agent] loaded %d channel routes", len(routes))
-	}
-
 	ba := &BusAgent{
-		busURL:       *busURL,
-		token:        *token,
-		consumer:     *consumer,
-		inberBin:     *inberBin,
-		inberDir:     *inberDir,
-		defaultAgent: *defaultAgent,
-		routes:       routes,
-		http:         &http.Client{Timeout: 10 * time.Second},
-		queues:       make(map[string]*agentQueue),
-		ctx:          ctx,
+		busURL:   *busURL,
+		token:    *token,
+		consumer: *consumer,
+		config:   &cfg,
+		backends: backends,
+		http:     &http.Client{Timeout: 10 * time.Second},
+		queues:   make(map[string]*agentQueue),
+		ctx:      ctx,
 	}
 
-	// Start HTTP API for model status (dashboard queries this via proxy)
 	go ba.serveAPI()
-
 	ba.run()
 	ba.wg.Wait()
 }
 
-// resolveAgent maps a channel to an agent name using configured routes.
+// resolveAgent returns the agent name for a given channel.
 func (ba *BusAgent) resolveAgent(channel string) string {
-	for _, r := range ba.routes {
-		if strings.HasPrefix(channel, r.Prefix) || channel == r.Prefix {
+	for _, r := range ba.config.Routes {
+		if r.Channel != "" && !strings.HasPrefix(channel, r.Channel) {
+			continue
+		}
+		if r.Agent != "" {
 			return r.Agent
 		}
 	}
-	return ba.defaultAgent
+	return ba.config.DefaultAgent
+}
+
+// resolveBackend returns the backend for a given agent.
+// Checks agents map first, then route-level overrides, then default.
+func (ba *BusAgent) resolveBackend(agent string) Backend {
+	// Explicit agent → backend mapping.
+	if name, ok := ba.config.Agents[agent]; ok {
+		if b, ok := ba.backends[name]; ok {
+			return b
+		}
+	}
+	return ba.backends[ba.config.DefaultBackend]
 }
 
 // getOrCreateQueue returns the queue for an agent, creating one if needed.
-// Each queue gets its own goroutine for sequential processing.
 func (ba *BusAgent) getOrCreateQueue(name string) *agentQueue {
 	ba.queuesMu.Lock()
 	defer ba.queuesMu.Unlock()
@@ -189,17 +302,35 @@ func (ba *BusAgent) getOrCreateQueue(name string) *agentQueue {
 	return q
 }
 
-// runQueue processes tasks for a single agent, one at a time.
+// runQueue processes tasks for a single agent sequentially,
+// dispatching each to the appropriate backend.
 func (ba *BusAgent) runQueue(q *agentQueue) {
 	defer ba.wg.Done()
 
 	for {
 		select {
 		case task := <-q.ch:
-			resp, spawns := ba.processWithInber(q, task.msg)
+			backend := ba.resolveBackend(q.name)
+
+			// Create injection channel for this run.
+			inject := make(chan siMessage, 10)
+			q.mu.Lock()
+			q.running = true
+			q.inject = inject
+			q.mu.Unlock()
+
+			resp, spawns := backend.Run(ba.ctx, q.name, task.msg, inject)
+
+			// Clear injection state.
+			q.mu.Lock()
+			q.running = false
+			q.inject = nil
+			q.mu.Unlock()
+			close(inject)
+
 			ba.publish(resp)
 
-			// Route spawn requests to target agent queues
+			// Route spawn requests to target agent queues.
 			for _, s := range spawns {
 				tq := ba.getOrCreateQueue(s.Agent)
 				tq.ch <- agentTask{
@@ -254,16 +385,13 @@ func (ba *BusAgent) subscribe() error {
 	defer conn.Close()
 	log.Printf("[bus-agent] subscribed to inbound")
 
-	// Reset read deadline when server pings us (gorilla handles pong reply,
-	// but ReadMessage() doesn't return for control frames so deadline isn't
-	// naturally extended during idle periods).
+	// Reset read deadline when server pings us.
 	conn.SetPingHandler(func(appData string) error {
 		conn.SetReadDeadline(time.Now().Add(120 * time.Second))
 		return conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(10*time.Second))
 	})
 
-	// Client-side keepalive — detect dead tunnel faster than waiting for
-	// the full read deadline to expire.
+	// Client-side keepalive pings.
 	done := make(chan struct{})
 	defer close(done)
 	go func() {
@@ -311,26 +439,20 @@ func (ba *BusAgent) subscribe() error {
 		log.Printf("[bus-agent] ← [%s] %s: %s",
 			siMsg.Channel, siMsg.Author, truncate(siMsg.Text, 80))
 
-		// Route to agent: inject into running process or queue for next run
+		// Route to agent queue, or inject into running process.
 		agentName := ba.resolveAgent(siMsg.Channel)
 		q := ba.getOrCreateQueue(agentName)
 
 		injected := false
 		q.mu.Lock()
-		if q.running && q.stdinPipe != nil {
-			// Agent is mid-run — inject via stdin (JSON line)
-			input := siMsg.Text
-			if siMsg.Author != "" {
-				input = fmt.Sprintf("[%s] %s", siMsg.Author, input)
-			}
-			injectMsg := struct {
-				Text   string `json:"text"`
-				Author string `json:"author,omitempty"`
-			}{Text: input, Author: siMsg.Author}
-			data, _ := json.Marshal(injectMsg)
-			if _, err := q.stdinPipe.Write(append(data, '\n')); err == nil {
+		if q.running && q.inject != nil {
+			select {
+			case q.inject <- siMsg:
 				injected = true
-				log.Printf("[bus-agent] injected into running %s: %s", agentName, truncate(input, 60))
+				log.Printf("[bus-agent] injected into running %s: %s",
+					agentName, truncate(siMsg.Text, 60))
+			default:
+				// Injection buffer full — queue as new task.
 			}
 		}
 		q.mu.Unlock()
@@ -341,159 +463,6 @@ func (ba *BusAgent) subscribe() error {
 
 		ba.ack(msg.Topic, msg.ID)
 	}
-}
-
-// processWithInber runs inber for a single message and returns the response
-// plus any spawn requests found in stderr.
-// The caller (runQueue) must set q.stdinPipe before calling and clear it after.
-func (ba *BusAgent) processWithInber(q *agentQueue, msg siMessage) (siMessage, []spawnRequest) {
-	args := []string{"run", "-a", q.name}
-
-	cmdCtx, cancel := context.WithTimeout(ba.ctx, 10*time.Minute)
-	defer cancel()
-
-	start := time.Now()
-
-	cmd := exec.CommandContext(cmdCtx, ba.inberBin, args...)
-	cmd.Dir = ba.inberDir
-	cmd.Env = os.Environ()
-
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		return siMessage{Text: "error: " + err.Error(), Channel: msg.Channel, Timestamp: time.Now()}, nil
-	}
-
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return siMessage{Text: "error: " + err.Error(), Channel: msg.Channel, Timestamp: time.Now()}, nil
-	}
-
-	stderr, _ := cmd.StderrPipe()
-
-	if err := cmd.Start(); err != nil {
-		return siMessage{Text: "error starting inber: " + err.Error(), Channel: msg.Channel, Timestamp: time.Now()}, nil
-	}
-
-	// Write initial message as JSON line (keeps stdin open for injections)
-	input := msg.Text
-	if msg.Author != "" {
-		input = fmt.Sprintf("[%s] %s", msg.Author, msg.Text)
-	}
-	initMsg := struct {
-		Text   string `json:"text"`
-		Author string `json:"author,omitempty"`
-	}{Text: input, Author: msg.Author}
-	initData, _ := json.Marshal(initMsg)
-	stdin.Write(append(initData, '\n'))
-
-	// Expose stdin pipe so subscribe loop can inject follow-up messages
-	q.mu.Lock()
-	q.running = true
-	q.stdinPipe = stdin
-	q.mu.Unlock()
-
-	output, _ := io.ReadAll(stdout)
-	errData, _ := io.ReadAll(stderr)
-
-	// Close stdin and clear pipe before Wait (signals EOF to inber)
-	q.mu.Lock()
-	q.running = false
-	q.stdinPipe = nil
-	q.mu.Unlock()
-	stdin.Close()
-
-	cmd.Wait()
-
-	duration := time.Since(start)
-	stderrStr := string(errData)
-
-	text := strings.TrimSpace(string(output))
-	if text == "" && len(errData) > 0 {
-		text = strings.TrimSpace(stderrStr)
-	}
-
-	meta := parseInberMeta(stderrStr, duration, q.name)
-	spawns := parseInberSpawns(stderrStr)
-
-	log.Printf("[bus-agent] → [%s] %s: %s (%.1fs)", msg.Channel, q.name, truncate(text, 80), duration.Seconds())
-
-	resp := siMessage{
-		Text:      text,
-		Channel:   msg.Channel,
-		Author:    q.name,
-		Timestamp: time.Now(),
-		Meta:      meta,
-	}
-
-	return resp, spawns
-}
-
-// parseInberSpawns extracts INBER_SPAWN:{...} lines from stderr.
-func parseInberSpawns(stderr string) []spawnRequest {
-	var spawns []spawnRequest
-	for _, line := range strings.Split(stderr, "\n") {
-		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "INBER_SPAWN:") {
-			continue
-		}
-		jsonStr := strings.TrimPrefix(line, "INBER_SPAWN:")
-		var s spawnRequest
-		if err := json.Unmarshal([]byte(jsonStr), &s); err != nil {
-			log.Printf("[bus-agent] failed to parse INBER_SPAWN: %v", err)
-			continue
-		}
-		if s.Agent != "" && s.Task != "" {
-			spawns = append(spawns, s)
-		}
-	}
-	return spawns
-}
-
-// parseInberMeta extracts INBER_META:{...} from stderr.
-func parseInberMeta(stderr string, duration time.Duration, model string) *messageMeta {
-	for _, line := range strings.Split(stderr, "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "INBER_META:") {
-			jsonStr := strings.TrimPrefix(line, "INBER_META:")
-			var meta messageMeta
-			if err := json.Unmarshal([]byte(jsonStr), &meta); err == nil {
-				meta.DurationMs = duration.Milliseconds()
-				return &meta
-			}
-		}
-	}
-
-	// Fallback: parse box-drawing format
-	meta := &messageMeta{
-		DurationMs: duration.Milliseconds(),
-		Model:      model,
-	}
-
-	for _, line := range strings.Split(stderr, "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "│ in=") {
-			fmt.Sscanf(line, "│ in=%d out=%d total=%*d tools=%d",
-				&meta.InputTokens, &meta.OutputTokens, &meta.ToolCalls)
-		}
-		if strings.Contains(line, "│ cache:") {
-			fmt.Sscanf(line, "│ cache: %d read, %d created",
-				&meta.CacheReadTokens, &meta.CacheCreationTokens)
-		}
-		if strings.HasPrefix(line, "│ cost=") {
-			fmt.Sscanf(line, "│ cost=$%f", &meta.Cost)
-		}
-		if strings.HasPrefix(line, "model:") {
-			parts := strings.Fields(line)
-			if len(parts) >= 2 {
-				meta.Model = parts[1]
-			}
-		}
-	}
-
-	if meta.InputTokens > 0 || meta.OutputTokens > 0 || meta.Cost > 0 {
-		return meta
-	}
-	return nil
 }
 
 func (ba *BusAgent) publish(msg siMessage) {
@@ -544,7 +513,8 @@ func envOr(key, fallback string) string {
 	return fallback
 }
 
-// serveAPI starts an HTTP server for dashboard queries.
+// --- API server (model status dashboard) ---
+
 func (ba *BusAgent) serveAPI() {
 	port := envOr("BUS_AGENT_API_PORT", "8101")
 
@@ -579,12 +549,21 @@ func (ba *BusAgent) handleModelTest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Run a minimal inber call to test the model
+	// Find the default CLI backend's binary for model testing.
+	var inberBin, inberDir string
+	if bcfg, ok := ba.config.Backends[ba.config.DefaultBackend]; ok && bcfg.Type == "cli" && len(bcfg.Cmd) > 0 {
+		inberBin = expandHome(bcfg.Cmd[0])
+		inberDir = expandHome(bcfg.Dir)
+	} else {
+		http.Error(w, `{"error":"no CLI backend for model testing"}`, http.StatusBadRequest)
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, ba.inberBin, "run", "--raw", "--no-tools", "--new", "--detach", "-m", req.Model, "Reply with just: ok")
-	cmd.Dir = ba.inberDir
+	cmd := exec.CommandContext(ctx, inberBin, "run", "--raw", "--no-tools", "--new", "--detach", "-m", req.Model, "Reply with just: ok")
+	cmd.Dir = inberDir
 	cmd.Env = os.Environ()
 
 	start := time.Now()
@@ -598,7 +577,6 @@ func (ba *BusAgent) handleModelTest(w http.ResponseWriter, r *http.Request) {
 
 	if err != nil {
 		result["status"] = "error"
-		// Extract useful error from output
 		errText := string(output)
 		if len(errText) > 200 {
 			errText = errText[len(errText)-200:]
