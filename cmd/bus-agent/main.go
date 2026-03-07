@@ -77,6 +77,11 @@ type agentTask struct {
 type agentQueue struct {
 	name string
 	ch   chan agentTask
+
+	// Active process state — protected by mu
+	mu        sync.Mutex
+	running   bool
+	stdinPipe io.WriteCloser // open stdin of running inber process
 }
 
 // --- bus agent ---
@@ -187,7 +192,7 @@ func (ba *BusAgent) runQueue(q *agentQueue) {
 	for {
 		select {
 		case task := <-q.ch:
-			resp, spawns := ba.processWithInber(q.name, task.msg)
+			resp, spawns := ba.processWithInber(q, task.msg)
 			ba.publish(resp)
 
 			// Route spawn requests to target agent queues
@@ -273,25 +278,43 @@ func (ba *BusAgent) subscribe() error {
 		log.Printf("[bus-agent] ← [%s] %s: %s",
 			siMsg.Channel, siMsg.Author, truncate(siMsg.Text, 80))
 
-		// Route to agent queue (non-blocking dispatch)
+		// Route to agent: inject into running process or queue for next run
 		agentName := ba.resolveAgent(siMsg.Channel)
 		q := ba.getOrCreateQueue(agentName)
-		q.ch <- agentTask{msg: siMsg}
 
-		// Ack immediately — message is queued for processing
+		injected := false
+		q.mu.Lock()
+		if q.running && q.stdinPipe != nil {
+			// Agent is mid-run — inject via stdin (JSON line)
+			input := siMsg.Text
+			if siMsg.Author != "" {
+				input = fmt.Sprintf("[%s] %s", siMsg.Author, input)
+			}
+			injectMsg := struct {
+				Text   string `json:"text"`
+				Author string `json:"author,omitempty"`
+			}{Text: input, Author: siMsg.Author}
+			data, _ := json.Marshal(injectMsg)
+			if _, err := q.stdinPipe.Write(append(data, '\n')); err == nil {
+				injected = true
+				log.Printf("[bus-agent] injected into running %s: %s", agentName, truncate(input, 60))
+			}
+		}
+		q.mu.Unlock()
+
+		if !injected {
+			q.ch <- agentTask{msg: siMsg}
+		}
+
 		ba.ack(msg.Topic, msg.ID)
 	}
 }
 
 // processWithInber runs inber for a single message and returns the response
 // plus any spawn requests found in stderr.
-func (ba *BusAgent) processWithInber(agentName string, msg siMessage) (siMessage, []spawnRequest) {
-	args := []string{"run", "-a", agentName}
-
-	input := msg.Text
-	if msg.Author != "" {
-		input = fmt.Sprintf("[%s] %s", msg.Author, msg.Text)
-	}
+// The caller (runQueue) must set q.stdinPipe before calling and clear it after.
+func (ba *BusAgent) processWithInber(q *agentQueue, msg siMessage) (siMessage, []spawnRequest) {
+	args := []string{"run", "-a", q.name}
 
 	cmdCtx, cancel := context.WithTimeout(ba.ctx, 10*time.Minute)
 	defer cancel()
@@ -318,11 +341,34 @@ func (ba *BusAgent) processWithInber(agentName string, msg siMessage) (siMessage
 		return siMessage{Text: "error starting inber: " + err.Error(), Channel: msg.Channel, Timestamp: time.Now()}, nil
 	}
 
-	stdin.Write([]byte(input))
-	stdin.Close()
+	// Write initial message as JSON line (keeps stdin open for injections)
+	input := msg.Text
+	if msg.Author != "" {
+		input = fmt.Sprintf("[%s] %s", msg.Author, msg.Text)
+	}
+	initMsg := struct {
+		Text   string `json:"text"`
+		Author string `json:"author,omitempty"`
+	}{Text: input, Author: msg.Author}
+	initData, _ := json.Marshal(initMsg)
+	stdin.Write(append(initData, '\n'))
+
+	// Expose stdin pipe so subscribe loop can inject follow-up messages
+	q.mu.Lock()
+	q.running = true
+	q.stdinPipe = stdin
+	q.mu.Unlock()
 
 	output, _ := io.ReadAll(stdout)
 	errData, _ := io.ReadAll(stderr)
+
+	// Close stdin and clear pipe before Wait (signals EOF to inber)
+	q.mu.Lock()
+	q.running = false
+	q.stdinPipe = nil
+	q.mu.Unlock()
+	stdin.Close()
+
 	cmd.Wait()
 
 	duration := time.Since(start)
@@ -333,15 +379,15 @@ func (ba *BusAgent) processWithInber(agentName string, msg siMessage) (siMessage
 		text = strings.TrimSpace(stderrStr)
 	}
 
-	meta := parseInberMeta(stderrStr, duration, agentName)
+	meta := parseInberMeta(stderrStr, duration, q.name)
 	spawns := parseInberSpawns(stderrStr)
 
-	log.Printf("[bus-agent] → [%s] %s: %s (%.1fs)", msg.Channel, agentName, truncate(text, 80), duration.Seconds())
+	log.Printf("[bus-agent] → [%s] %s: %s (%.1fs)", msg.Channel, q.name, truncate(text, 80), duration.Seconds())
 
 	resp := siMessage{
 		Text:      text,
 		Channel:   msg.Channel,
-		Author:    agentName,
+		Author:    q.name,
 		Timestamp: time.Now(),
 		Meta:      meta,
 	}
