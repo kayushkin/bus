@@ -32,7 +32,9 @@ type BackendConfig struct {
 	URL         string   `json:"url,omitempty"`          // HTTP/OpenAI: base URL
 	Token       string   `json:"token,omitempty"`        // HTTP/OpenAI: auth token
 	Model       string   `json:"model,omitempty"`        // OpenAI: model field (default "openclaw")
-	AgentHeader string   `json:"agent_header,omitempty"` // OpenAI: header for agent routing (e.g. "x-openclaw-agent-id")
+	AgentHeader string            `json:"agent_header,omitempty"` // OpenAI: header for agent routing (e.g. "x-openclaw-agent-id")
+	AgentMap    map[string]string `json:"agent_map,omitempty"`    // OpenAI: bus name → backend agent ID (e.g. "claxon" → "main")
+	SessionKey  string            `json:"session_key,omitempty"`  // OpenAI: session key template. {agent} = mapped agent ID. Sent as x-openclaw-session-key.
 }
 
 // NewBackend creates a Backend from config.
@@ -77,13 +79,15 @@ func NewBackend(name string, cfg BackendConfig) (Backend, error) {
 			model = "openclaw"
 		}
 		return &OpenAIBackend{
-			name:        name,
-			url:         cfg.URL,
-			token:       cfg.Token,
-			model:       model,
-			agentHeader: cfg.AgentHeader,
-			timeout:     timeout,
-			client:      &http.Client{Timeout: timeout},
+			name:           name,
+			url:            cfg.URL,
+			token:          cfg.Token,
+			model:          model,
+			agentHeader:    cfg.AgentHeader,
+			agentMap:       cfg.AgentMap,
+			sessionKeyTmpl: cfg.SessionKey,
+			timeout:        timeout,
+			client:         &http.Client{Timeout: timeout},
 		}, nil
 
 	default:
@@ -283,20 +287,33 @@ func (b *HTTPBackend) Run(ctx context.Context, agent string, msg siMessage, _ <-
 // or any OpenAI-compatible API. Full agent runs with tools when backed by OpenClaw.
 
 type OpenAIBackend struct {
-	name        string
-	url         string // base URL (e.g., http://localhost:18789)
-	token       string // bearer token
-	model       string // model field (e.g., "openclaw")
-	agentHeader string // header for agent routing (e.g., "x-openclaw-agent-id")
-	timeout     time.Duration
-	client      *http.Client
+	name           string
+	url            string            // base URL (e.g., http://localhost:18789)
+	token          string            // bearer token
+	model          string            // model field (e.g., "openclaw")
+	agentHeader    string            // header for agent routing (e.g., "x-openclaw-agent-id")
+	agentMap       map[string]string // bus agent name → backend agent ID
+	sessionKeyTmpl string            // session key template ({agent} = mapped ID)
+	timeout        time.Duration
+	client         *http.Client
 
 	// Per-agent conversation history (keyed by "agent:channel").
-	mu      sync.Mutex
-	convos  map[string][]openaiChatMessage
+	mu     sync.Mutex
+	convos map[string][]openaiChatMessage
 }
 
 const maxConvoMessages = 100 // keep last N messages per conversation
+
+// resolveAgentID maps a bus agent name to the backend's agent ID.
+// Falls back to the bus name if no mapping exists.
+func (b *OpenAIBackend) resolveAgentID(busName string) string {
+	if b.agentMap != nil {
+		if mapped, ok := b.agentMap[busName]; ok {
+			return mapped
+		}
+	}
+	return busName
+}
 
 func (b *OpenAIBackend) conversationKey(agent, channel string) string {
 	return agent + ":" + channel
@@ -328,6 +345,8 @@ func (b *OpenAIBackend) getHistory(key string) []openaiChatMessage {
 }
 
 func (b *OpenAIBackend) Run(ctx context.Context, agent string, msg siMessage, _ <-chan siMessage) (siMessage, []spawnRequest) {
+	backendAgent := b.resolveAgentID(agent)
+
 	// Build user message content.
 	content := msg.Text
 	if msg.Author != "" {
@@ -341,18 +360,12 @@ func (b *OpenAIBackend) Run(ctx context.Context, agent string, msg siMessage, _ 
 	// Send full conversation history.
 	history := b.getHistory(key)
 
-	// Use agent:channel as a stable user ID so OpenClaw derives
-	// a persistent session key — same user = same session = conversation continuity.
-	userID := agent + ":" + msg.Channel
-
 	reqBody := struct {
 		Model    string              `json:"model"`
 		Messages []openaiChatMessage `json:"messages"`
-		User     string              `json:"user,omitempty"`
 	}{
 		Model:    b.model,
 		Messages: history,
-		User:     userID,
 	}
 	data, _ := json.Marshal(reqBody)
 
@@ -366,7 +379,12 @@ func (b *OpenAIBackend) Run(ctx context.Context, agent string, msg siMessage, _ 
 		req.Header.Set("Authorization", "Bearer "+b.token)
 	}
 	if b.agentHeader != "" {
-		req.Header.Set(b.agentHeader, agent)
+		req.Header.Set(b.agentHeader, backendAgent)
+	}
+	// Session key for persistent session routing.
+	if b.sessionKeyTmpl != "" {
+		sessionKey := strings.ReplaceAll(b.sessionKeyTmpl, "{agent}", backendAgent)
+		req.Header.Set("x-openclaw-session-key", sessionKey)
 	}
 
 	start := time.Now()
