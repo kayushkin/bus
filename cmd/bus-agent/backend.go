@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -289,23 +290,63 @@ type OpenAIBackend struct {
 	agentHeader string // header for agent routing (e.g., "x-openclaw-agent-id")
 	timeout     time.Duration
 	client      *http.Client
+
+	// Per-agent conversation history (keyed by "agent:channel").
+	mu      sync.Mutex
+	convos  map[string][]openaiChatMessage
+}
+
+const maxConvoMessages = 100 // keep last N messages per conversation
+
+func (b *OpenAIBackend) conversationKey(agent, channel string) string {
+	return agent + ":" + channel
+}
+
+func (b *OpenAIBackend) appendMessage(key string, msg openaiChatMessage) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.convos == nil {
+		b.convos = make(map[string][]openaiChatMessage)
+	}
+	b.convos[key] = append(b.convos[key], msg)
+	// Sliding window: drop oldest messages beyond limit.
+	if len(b.convos[key]) > maxConvoMessages {
+		b.convos[key] = b.convos[key][len(b.convos[key])-maxConvoMessages:]
+	}
+}
+
+func (b *OpenAIBackend) getHistory(key string) []openaiChatMessage {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.convos == nil {
+		return nil
+	}
+	msgs := b.convos[key]
+	out := make([]openaiChatMessage, len(msgs))
+	copy(out, msgs)
+	return out
 }
 
 func (b *OpenAIBackend) Run(ctx context.Context, agent string, msg siMessage, _ <-chan siMessage) (siMessage, []spawnRequest) {
-	// Build OpenAI Chat Completions request.
+	// Build user message content.
 	content := msg.Text
 	if msg.Author != "" {
 		content = fmt.Sprintf("[%s] %s", msg.Author, msg.Text)
 	}
 
+	key := b.conversationKey(agent, msg.Channel)
+	userMsg := openaiChatMessage{Role: "user", Content: content}
+	b.appendMessage(key, userMsg)
+
+	// Send full conversation history.
+	history := b.getHistory(key)
+
 	reqBody := struct {
 		Model    string              `json:"model"`
 		Messages []openaiChatMessage `json:"messages"`
 	}{
-		Model: b.model,
-		Messages: []openaiChatMessage{
-			{Role: "user", Content: content},
-		},
+		Model:    b.model,
+		Messages: history,
 	}
 	data, _ := json.Marshal(reqBody)
 
@@ -347,15 +388,18 @@ func (b *OpenAIBackend) Run(ctx context.Context, agent string, msg siMessage, _ 
 		text = result.Choices[0].Message.Content
 	}
 
+	// Append assistant response to conversation history.
+	b.appendMessage(key, openaiChatMessage{Role: "assistant", Content: text})
+
 	meta := &messageMeta{
-		DurationMs:  duration.Milliseconds(),
-		Model:       result.Model,
-		InputTokens: result.Usage.PromptTokens,
+		DurationMs:   duration.Milliseconds(),
+		Model:        result.Model,
+		InputTokens:  result.Usage.PromptTokens,
 		OutputTokens: result.Usage.CompletionTokens,
 	}
 
-	log.Printf("[%s] → [%s] %s: %s (%.1fs)",
-		b.name, msg.Channel, agent, truncate(text, 80), duration.Seconds())
+	log.Printf("[%s] → [%s] %s: %s (%.1fs, %d msgs in history)",
+		b.name, msg.Channel, agent, truncate(text, 80), duration.Seconds(), len(history))
 
 	return siMessage{
 		Text:      text,
