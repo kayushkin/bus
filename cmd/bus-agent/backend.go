@@ -341,12 +341,18 @@ func (b *OpenAIBackend) Run(ctx context.Context, agent string, msg siMessage, _ 
 	// Send full conversation history.
 	history := b.getHistory(key)
 
+	// Use agent:channel as a stable user ID so OpenClaw derives
+	// a persistent session key — same user = same session = conversation continuity.
+	userID := agent + ":" + msg.Channel
+
 	reqBody := struct {
 		Model    string              `json:"model"`
 		Messages []openaiChatMessage `json:"messages"`
+		User     string              `json:"user,omitempty"`
 	}{
 		Model:    b.model,
 		Messages: history,
+		User:     userID,
 	}
 	data, _ := json.Marshal(reqBody)
 
