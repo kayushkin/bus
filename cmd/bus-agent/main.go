@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	modelstore "github.com/kayushkin/model-store"
 )
 
 // --- message types ---
@@ -147,6 +148,9 @@ func main() {
 		queues:       make(map[string]*agentQueue),
 		ctx:          ctx,
 	}
+
+	// Start HTTP API for model status (dashboard queries this via proxy)
+	go ba.serveAPI()
 
 	ba.run()
 	ba.wg.Wait()
@@ -509,4 +513,41 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// serveAPI starts an HTTP server for dashboard queries.
+func (ba *BusAgent) serveAPI() {
+	port := envOr("BUS_AGENT_API_PORT", "8101")
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/models", ba.handleModelsStatus)
+	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
+
+	log.Printf("[bus-agent] API server listening on :%s", port)
+	if err := http.ListenAndServe(":"+port, mux); err != nil {
+		log.Printf("[bus-agent] API server error: %v", err)
+	}
+}
+
+func (ba *BusAgent) handleModelsStatus(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	store, err := modelstore.Open("")
+	if err != nil {
+		http.Error(w, `{"error":"failed to open model store"}`, http.StatusInternalServerError)
+		return
+	}
+	defer store.Close()
+
+	statuses, err := store.AllModelsWithStatus()
+	if err != nil {
+		http.Error(w, `{"error":"failed to query models"}`, http.StatusInternalServerError)
+		return
+	}
+
+	json.NewEncoder(w).Encode(statuses)
 }
