@@ -32,7 +32,6 @@ type BackendConfig struct {
 	Token       string   `json:"token,omitempty"`        // HTTP/OpenAI: auth token
 	Model       string   `json:"model,omitempty"`        // OpenAI: model field (default "openclaw")
 	AgentHeader string   `json:"agent_header,omitempty"` // OpenAI: header for agent routing (e.g. "x-openclaw-agent-id")
-	AgentPrefix string   `json:"agent_prefix,omitempty"` // OpenAI: strip this prefix from agent name before sending
 }
 
 // NewBackend creates a Backend from config.
@@ -82,7 +81,6 @@ func NewBackend(name string, cfg BackendConfig) (Backend, error) {
 			token:       cfg.Token,
 			model:       model,
 			agentHeader: cfg.AgentHeader,
-			agentPrefix: cfg.AgentPrefix,
 			timeout:     timeout,
 			client:      &http.Client{Timeout: timeout},
 		}, nil
@@ -289,18 +287,11 @@ type OpenAIBackend struct {
 	token       string // bearer token
 	model       string // model field (e.g., "openclaw")
 	agentHeader string // header for agent routing (e.g., "x-openclaw-agent-id")
-	agentPrefix string // strip this prefix before sending (e.g., "oc-")
 	timeout     time.Duration
 	client      *http.Client
 }
 
 func (b *OpenAIBackend) Run(ctx context.Context, agent string, msg siMessage, _ <-chan siMessage) (siMessage, []spawnRequest) {
-	// Strip prefix for remote agent ID (e.g., "oc-kayushkin" → "kayushkin").
-	remoteAgent := agent
-	if b.agentPrefix != "" {
-		remoteAgent = strings.TrimPrefix(agent, b.agentPrefix)
-	}
-
 	// Build OpenAI Chat Completions request.
 	content := msg.Text
 	if msg.Author != "" {
@@ -328,7 +319,7 @@ func (b *OpenAIBackend) Run(ctx context.Context, agent string, msg siMessage, _ 
 		req.Header.Set("Authorization", "Bearer "+b.token)
 	}
 	if b.agentHeader != "" {
-		req.Header.Set(b.agentHeader, remoteAgent)
+		req.Header.Set(b.agentHeader, agent)
 	}
 
 	start := time.Now()
