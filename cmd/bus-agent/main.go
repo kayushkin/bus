@@ -300,7 +300,7 @@ func (ba *BusAgent) processWithInber(agentName string, msg siMessage) (siMessage
 
 	cmd := exec.CommandContext(cmdCtx, ba.inberBin, args...)
 	cmd.Dir = ba.inberDir
-	cmd.Env = append(os.Environ(), "INBER_BUS_SPAWN=1") // signal spawn tool to emit INBER_SPAWN
+	cmd.Env = os.Environ()
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
