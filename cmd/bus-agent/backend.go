@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -15,9 +16,12 @@ import (
 	"time"
 )
 
+// StreamFunc is called with each streaming delta chunk. If nil, no streaming.
+type StreamFunc func(delta siMessage)
+
 // Backend executes agent tasks.
 type Backend interface {
-	Run(ctx context.Context, agent string, msg siMessage, inject <-chan siMessage) (siMessage, []spawnRequest)
+	Run(ctx context.Context, agent string, msg siMessage, inject <-chan siMessage, onStream StreamFunc) (siMessage, []spawnRequest)
 }
 
 // BackendConfig defines a backend in the config file.
@@ -111,7 +115,7 @@ type CLIBackend struct {
 	timeout time.Duration
 }
 
-func (b *CLIBackend) Run(ctx context.Context, agent string, msg siMessage, injectCh <-chan siMessage) (siMessage, []spawnRequest) {
+func (b *CLIBackend) Run(ctx context.Context, agent string, msg siMessage, injectCh <-chan siMessage, _ StreamFunc) (siMessage, []spawnRequest) {
 	// Build command with {agent} placeholder replacement.
 	args := make([]string, len(b.cmd))
 	for i, a := range b.cmd {
@@ -225,7 +229,7 @@ type HTTPBackend struct {
 	client  *http.Client
 }
 
-func (b *HTTPBackend) Run(ctx context.Context, agent string, msg siMessage, _ <-chan siMessage) (siMessage, []spawnRequest) {
+func (b *HTTPBackend) Run(ctx context.Context, agent string, msg siMessage, _ <-chan siMessage, _ StreamFunc) (siMessage, []spawnRequest) {
 	reqBody := struct {
 		Text    string `json:"text"`
 		Agent   string `json:"agent"`
@@ -348,10 +352,9 @@ func (b *OpenAIBackend) getHistory(key string) []openaiChatMessage {
 	return out
 }
 
-func (b *OpenAIBackend) Run(ctx context.Context, agent string, msg siMessage, _ <-chan siMessage) (siMessage, []spawnRequest) {
+func (b *OpenAIBackend) Run(ctx context.Context, agent string, msg siMessage, _ <-chan siMessage, onStream StreamFunc) (siMessage, []spawnRequest) {
 	backendAgent := b.resolveAgentID(agent)
 
-	// Build user message content.
 	content := msg.Text
 	if msg.Author != "" {
 		content = fmt.Sprintf("[%s] %s", msg.Author, msg.Text)
@@ -361,15 +364,26 @@ func (b *OpenAIBackend) Run(ctx context.Context, agent string, msg siMessage, _ 
 	userMsg := openaiChatMessage{Role: "user", Content: content}
 	b.appendMessage(key, userMsg)
 
-	// Send full conversation history.
 	history := b.getHistory(key)
 
+	// Use streaming if callback is provided.
+	useStream := onStream != nil
+
+	type streamOpts struct {
+		IncludeUsage bool `json:"include_usage"`
+	}
 	reqBody := struct {
-		Model    string              `json:"model"`
-		Messages []openaiChatMessage `json:"messages"`
+		Model         string              `json:"model"`
+		Messages      []openaiChatMessage `json:"messages"`
+		Stream        bool                `json:"stream,omitempty"`
+		StreamOptions *streamOpts         `json:"stream_options,omitempty"`
 	}{
 		Model:    b.model,
 		Messages: history,
+		Stream:   useStream,
+	}
+	if useStream {
+		reqBody.StreamOptions = &streamOpts{IncludeUsage: true}
 	}
 	data, _ := json.Marshal(reqBody)
 
@@ -385,7 +399,6 @@ func (b *OpenAIBackend) Run(ctx context.Context, agent string, msg siMessage, _ 
 	if b.agentHeader != "" {
 		req.Header.Set(b.agentHeader, backendAgent)
 	}
-	// Session key for persistent session routing.
 	if b.sessionKeyTmpl != "" {
 		sessionKey := strings.ReplaceAll(b.sessionKeyTmpl, "{agent}", backendAgent)
 		req.Header.Set("x-openclaw-session-key", sessionKey)
@@ -398,54 +411,133 @@ func (b *OpenAIBackend) Run(ctx context.Context, agent string, msg siMessage, _ 
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
-	duration := time.Since(start)
-
 	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
 		return errResp(msg, fmt.Errorf("http %d: %s", resp.StatusCode,
 			truncate(string(body), 200))), nil
 	}
 
-	var result openaiChatCompletion
-	if err := json.Unmarshal(body, &result); err != nil {
-		return errResp(msg, fmt.Errorf("parse response: %w", err)), nil
+	var fullText string
+	var model string
+	var usage openaiUsage
+
+	if useStream {
+		// SSE streaming: read "data: {...}" lines.
+		streamID := fmt.Sprintf("s-%d", start.UnixMilli())
+		log.Printf("[%s] streaming started for %s (streamID=%s)", b.name, agent, streamID)
+		scanner := bufio.NewScanner(resp.Body)
+		chunkCount := 0
+		for scanner.Scan() {
+			line := scanner.Text()
+			if line == "" {
+				continue // SSE blank line separator
+			}
+			if !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			payload := strings.TrimPrefix(line, "data: ")
+			if payload == "[DONE]" {
+				log.Printf("[%s] stream done (%d chunks)", b.name, chunkCount)
+				break
+			}
+
+			var chunk openaiStreamChunk
+			if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+				continue
+			}
+
+			if chunk.Model != "" {
+				model = chunk.Model
+			}
+
+			// Extract usage from final chunk (OpenAI includes it in the last chunk).
+			if chunk.Usage.PromptTokens > 0 || chunk.Usage.CompletionTokens > 0 {
+				usage = chunk.Usage
+			}
+
+			if len(chunk.Choices) > 0 {
+				delta := chunk.Choices[0].Delta.Content
+				if delta != "" {
+					chunkCount++
+					fullText += delta
+					onStream(siMessage{
+						Text:         delta,
+						Channel:      msg.Channel,
+						Agent:        agent,
+						Author:       agent,
+						Orchestrator: b.name,
+						Stream:       "delta",
+						StreamID:     streamID,
+						Timestamp:    time.Now(),
+					})
+				}
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			log.Printf("[%s] scanner error: %v", b.name, err)
+		}
+	} else {
+		// Non-streaming: read full response.
+		body, _ := io.ReadAll(resp.Body)
+		var result openaiChatCompletion
+		if err := json.Unmarshal(body, &result); err != nil {
+			return errResp(msg, fmt.Errorf("parse response: %w", err)), nil
+		}
+		if len(result.Choices) > 0 {
+			fullText = result.Choices[0].Message.Content
+		}
+		model = result.Model
+		usage = result.Usage
 	}
 
-	text := ""
-	if len(result.Choices) > 0 {
-		text = result.Choices[0].Message.Content
-	}
+	duration := time.Since(start)
 
-	// Append assistant response to conversation history.
-	b.appendMessage(key, openaiChatMessage{Role: "assistant", Content: text})
+	b.appendMessage(key, openaiChatMessage{Role: "assistant", Content: fullText})
 
 	meta := &messageMeta{
 		DurationMs:          duration.Milliseconds(),
-		Model:               result.Model,
-		InputTokens:         result.Usage.PromptTokens,
-		OutputTokens:        result.Usage.CompletionTokens,
-		CacheReadTokens:     result.Usage.CacheReadTokens,
-		CacheCreationTokens: result.Usage.CacheCreationTokens,
+		Model:               model,
+		InputTokens:         usage.PromptTokens,
+		OutputTokens:        usage.CompletionTokens,
+		CacheReadTokens:     usage.CacheReadTokens,
+		CacheCreationTokens: usage.CacheCreationTokens,
 	}
 
 	log.Printf("[%s] → [%s] %s: %s (%.1fs, %d msgs in history)",
-		b.name, msg.Channel, agent, truncate(text, 80), duration.Seconds(), len(history))
+		b.name, msg.Channel, agent, truncate(fullText, 80), duration.Seconds(), len(history))
+
+	stream := ""
+	streamID := ""
+	if useStream {
+		stream = "done"
+		streamID = fmt.Sprintf("s-%d", start.UnixMilli())
+	}
 
 	return siMessage{
-		Text:         text,
+		Text:         fullText,
 		Channel:      msg.Channel,
 		Agent:        agent,
 		Author:       agent,
 		Orchestrator: b.name,
+		Stream:       stream,
+		StreamID:     streamID,
 		Timestamp:    time.Now(),
 		Meta:         meta,
 	}, nil
 }
 
-// OpenAI API types (minimal subset).
+// OpenAI API types.
 type openaiChatMessage struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
+}
+
+type openaiUsage struct {
+	PromptTokens        int `json:"prompt_tokens"`
+	CompletionTokens    int `json:"completion_tokens"`
+	TotalTokens         int `json:"total_tokens"`
+	CacheReadTokens     int `json:"cache_read_tokens"`
+	CacheCreationTokens int `json:"cache_creation_tokens"`
 }
 
 type openaiChatCompletion struct {
@@ -455,13 +547,19 @@ type openaiChatCompletion struct {
 		Message      openaiChatMessage `json:"message"`
 		FinishReason string            `json:"finish_reason"`
 	} `json:"choices"`
-	Usage struct {
-		PromptTokens        int `json:"prompt_tokens"`
-		CompletionTokens    int `json:"completion_tokens"`
-		TotalTokens         int `json:"total_tokens"`
-		CacheReadTokens     int `json:"cache_read_tokens"`
-		CacheCreationTokens int `json:"cache_creation_tokens"`
-	} `json:"usage"`
+	Usage openaiUsage `json:"usage"`
+}
+
+type openaiStreamChunk struct {
+	ID      string `json:"id"`
+	Model   string `json:"model"`
+	Choices []struct {
+		Delta struct {
+			Content string `json:"content"`
+		} `json:"delta"`
+		FinishReason *string `json:"finish_reason"`
+	} `json:"choices"`
+	Usage openaiUsage `json:"usage"`
 }
 
 // --- parse helpers (used by CLIBackend) ---

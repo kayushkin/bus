@@ -99,6 +99,8 @@ type siMessage struct {
 	ReplyTo      string       `json:"reply_to,omitempty"`
 	MediaURL     string       `json:"media_url,omitempty"`
 	Timestamp    time.Time    `json:"timestamp"`
+	Stream       string       `json:"stream,omitempty"`    // "delta" or "done"
+	StreamID     string       `json:"stream_id,omitempty"` // groups deltas with their final message
 	Meta         *messageMeta `json:"meta,omitempty"`
 }
 
@@ -328,7 +330,13 @@ func (ba *BusAgent) runQueue(q *agentQueue) {
 			q.inject = inject
 			q.mu.Unlock()
 
-			resp, spawns := backend.Run(ba.ctx, task.target.Name, task.msg, inject)
+			// Stream callback: publish deltas to bus in real-time.
+			var onStream StreamFunc
+			onStream = func(delta siMessage) {
+				ba.publish(delta)
+			}
+
+			resp, spawns := backend.Run(ba.ctx, task.target.Name, task.msg, inject, onStream)
 
 			// Clear injection state.
 			q.mu.Lock()
