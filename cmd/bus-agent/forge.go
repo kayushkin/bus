@@ -30,35 +30,29 @@ func NewForgeManager() *ForgeManager {
 	return &ForgeManager{forge: f, held: make(map[string]*forge.Slot)}
 }
 
-// Acquire tries to get a slot for the given agent working on a project.
-// Returns the slot path, or empty string if no slot available or no project match.
-func (fm *ForgeManager) Acquire(agentName, sessionID, repoRoot string) (slotPath string, slotKey string) {
+// AcquireByProject tries to get a slot for an agent by forge project ID.
+func (fm *ForgeManager) AcquireByProject(agentName, sessionID, projectID string) (slotPath string, slotKey string) {
 	if fm.forge == nil {
-		return "", ""
-	}
-
-	proj := fm.forge.FindProjectByPath(repoRoot)
-	if proj == nil {
 		return "", ""
 	}
 
 	fm.mu.Lock()
 	defer fm.mu.Unlock()
 
-	slot, err := fm.forge.Acquire(proj.ID, forge.AcquireOpts{
+	slot, err := fm.forge.Acquire(projectID, forge.AcquireOpts{
 		AgentID:      agentName,
 		SessionID:    sessionID,
 		Orchestrator: "bus-agent",
 	})
 	if err != nil {
-		log.Printf("[forge] no slots for %q (project %s): %v", agentName, proj.ID, err)
+		log.Printf("[forge] no slots for %q (project %s): %v", agentName, projectID, err)
 		return "", ""
 	}
 
 	// Pull latest into slot
-	fm.forge.SlotPull(proj.ID, slot.ID)
+	fm.forge.SlotPull(projectID, slot.ID)
 
-	key := proj.ID + ":" + sessionID
+	key := projectID + ":" + sessionID
 	fm.held[key] = slot
 	log.Printf("[forge] %s acquired slot %d → %s", agentName, slot.ID, slot.Path)
 	return slot.Path, key

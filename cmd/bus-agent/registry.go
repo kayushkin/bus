@@ -25,6 +25,7 @@ type AgentEntry struct {
 	Name         string `json:"name"`
 	Orchestrator string `json:"orchestrator"`
 	Description  string `json:"description,omitempty"`
+	Project      string `json:"project,omitempty"` // forge project ID for slot acquisition
 	Enabled      bool   `json:"enabled"`
 }
 
@@ -304,7 +305,7 @@ func (r *AgentRegistry) SetBackend(b BackendEntry) error {
 
 func (r *AgentRegistry) ListAgents() ([]AgentEntry, error) {
 	rows, err := r.db.Query(
-		"SELECT name, orchestrator, COALESCE(description,''), enabled FROM agents ORDER BY orchestrator, name")
+		"SELECT name, orchestrator, COALESCE(description,''), COALESCE(project,''), enabled FROM agents ORDER BY orchestrator, name")
 	if err != nil {
 		return nil, err
 	}
@@ -314,7 +315,7 @@ func (r *AgentRegistry) ListAgents() ([]AgentEntry, error) {
 	for rows.Next() {
 		var a AgentEntry
 		var enabled int
-		if err := rows.Scan(&a.Name, &a.Orchestrator, &a.Description, &enabled); err != nil {
+		if err := rows.Scan(&a.Name, &a.Orchestrator, &a.Description, &a.Project, &enabled); err != nil {
 			continue
 		}
 		a.Enabled = enabled == 1
@@ -327,9 +328,9 @@ func (r *AgentRegistry) GetAgent(name, orchestrator string) (*AgentEntry, error)
 	var a AgentEntry
 	var enabled int
 	err := r.db.QueryRow(
-		"SELECT name, orchestrator, COALESCE(description,''), enabled FROM agents WHERE name = ? AND orchestrator = ?",
+		"SELECT name, orchestrator, COALESCE(description,''), COALESCE(project,''), enabled FROM agents WHERE name = ? AND orchestrator = ?",
 		name, orchestrator).
-		Scan(&a.Name, &a.Orchestrator, &a.Description, &enabled)
+		Scan(&a.Name, &a.Orchestrator, &a.Description, &a.Project, &enabled)
 	if err != nil {
 		return nil, err
 	}
@@ -379,7 +380,7 @@ func (r *AgentRegistry) ResolveAgent(name, orchestrator string) (*AgentEntry, bo
 // enabled agent has that name. If ambiguous (multiple orchestrators), returns false.
 func (r *AgentRegistry) FindAgent(name string) (*AgentEntry, bool) {
 	rows, err := r.db.Query(
-		"SELECT name, orchestrator, COALESCE(description,''), enabled FROM agents WHERE name = ? AND enabled = 1", name)
+		"SELECT name, orchestrator, COALESCE(description,''), COALESCE(project,''), enabled FROM agents WHERE name = ? AND enabled = 1", name)
 	if err != nil {
 		return nil, false
 	}
@@ -389,7 +390,7 @@ func (r *AgentRegistry) FindAgent(name string) (*AgentEntry, bool) {
 	for rows.Next() {
 		var a AgentEntry
 		var enabled int
-		if err := rows.Scan(&a.Name, &a.Orchestrator, &a.Description, &enabled); err == nil {
+		if err := rows.Scan(&a.Name, &a.Orchestrator, &a.Description, &a.Project, &enabled); err == nil {
 			a.Enabled = enabled == 1
 			matches = append(matches, a)
 		}

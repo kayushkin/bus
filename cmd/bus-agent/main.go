@@ -331,20 +331,19 @@ func (ba *BusAgent) runQueue(q *agentQueue) {
 			// Acquire forge slot for isolated work.
 			var runOpts RunOpts
 			var slotKey string
-			if cliBackend, ok := backend.(*CLIBackend); ok && cliBackend.dir != "" {
-				repoRoot := expandHome(replaceVars(cliBackend.dir, task.target.Name))
+			if agentEntry, ok := ba.registry.FindAgent(task.target.Name); ok && agentEntry.Project != "" {
+				// Look up project's base repo from forge
 				sessionID := fmt.Sprintf("%s-%d", task.target.Name, time.Now().UnixMilli())
-				slotPath, key := ba.forge.Acquire(task.target.Name, sessionID, repoRoot)
+				slotPath, key := ba.forge.AcquireByProject(task.target.Name, sessionID, agentEntry.Project)
 				if slotPath != "" {
 					runOpts.WorkDir = slotPath
 					slotKey = key
 				} else {
 					// No slot available — wait for one to free up
-					log.Printf("[bus-agent] %s/%s: waiting for forge slot...",
-						task.target.Name, task.target.Orchestrator)
+					log.Printf("[bus-agent] %s/%s: waiting for forge slot (project=%s)...",
+						task.target.Name, task.target.Orchestrator, agentEntry.Project)
 					if ba.forge.WaitForSlot(ba.ctx) {
-						// Retry acquisition
-						slotPath, key = ba.forge.Acquire(task.target.Name, sessionID, repoRoot)
+						slotPath, key = ba.forge.AcquireByProject(task.target.Name, sessionID, agentEntry.Project)
 						if slotPath != "" {
 							runOpts.WorkDir = slotPath
 							slotKey = key
