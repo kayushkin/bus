@@ -338,12 +338,19 @@ func (ba *BusAgent) runQueue(q *agentQueue) {
 
 			resp, spawns := backend.Run(ba.ctx, task.target.Name, task.msg, inject, onStream)
 
-			// Clear injection state.
+			// Clear injection state and re-queue any unread injected messages.
 			q.mu.Lock()
 			q.running = false
 			q.inject = nil
 			q.mu.Unlock()
 			close(inject)
+
+			// Drain unread injected messages back to the queue so they aren't lost.
+			for leftover := range inject {
+				log.Printf("[bus-agent] re-queuing unread injection for %s/%s: %s",
+					task.target.Name, task.target.Orchestrator, truncate(leftover.Text, 60))
+				q.ch <- agentTask{msg: leftover, target: task.target}
+			}
 
 			ba.publish(resp)
 
