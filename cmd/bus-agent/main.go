@@ -570,7 +570,6 @@ func (ba *BusAgent) serveAPI() {
 	mux.HandleFunc("/api/models/test", ba.handleModelTest)
 	mux.HandleFunc("/api/models/toggle", ba.handleModelToggle)
 	mux.HandleFunc("/api/models", ba.handleModelsStatus)
-	mux.HandleFunc("/api/usage", ba.handleUsage)
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
