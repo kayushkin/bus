@@ -39,6 +39,7 @@ type BackendConfig struct {
 	AgentHeader string            `json:"agent_header,omitempty"` // OpenAI: header for agent routing (e.g. "x-openclaw-agent-id")
 	AgentMap    map[string]string `json:"agent_map,omitempty"`    // OpenAI: bus name → backend agent ID (e.g. "claxon" → "main")
 	SessionKey  string            `json:"session_key,omitempty"`  // OpenAI: session key template. {agent} = mapped agent ID. Sent as x-openclaw-session-key.
+	NoStream    bool              `json:"no_stream,omitempty"`    // OpenAI: disable streaming (for backends that don't support usage in stream)
 }
 
 // NewBackend creates a Backend from config.
@@ -90,6 +91,7 @@ func NewBackend(name string, cfg BackendConfig) (Backend, error) {
 			agentHeader:    cfg.AgentHeader,
 			agentMap:       cfg.AgentMap,
 			sessionKeyTmpl: cfg.SessionKey,
+			noStream:       cfg.NoStream,
 			timeout:        timeout,
 			client:         &http.Client{Timeout: timeout},
 		}, nil
@@ -343,6 +345,7 @@ type OpenAIBackend struct {
 	agentHeader    string            // header for agent routing (e.g., "x-openclaw-agent-id")
 	agentMap       map[string]string // bus agent name → backend agent ID
 	sessionKeyTmpl string            // session key template ({agent} = mapped ID)
+	noStream       bool              // disable streaming (backend doesn't support usage in stream)
 	timeout        time.Duration
 	client         *http.Client
 
@@ -406,8 +409,8 @@ func (b *OpenAIBackend) Run(ctx context.Context, agent string, msg siMessage, _ 
 
 	history := b.getHistory(key)
 
-	// Use streaming if callback is provided.
-	useStream := onStream != nil
+	// Use streaming if callback is provided and not explicitly disabled.
+	useStream := onStream != nil && !b.noStream
 
 	type streamOpts struct {
 		IncludeUsage bool `json:"include_usage"`
@@ -534,7 +537,9 @@ func (b *OpenAIBackend) Run(ctx context.Context, agent string, msg siMessage, _ 
 
 	b.appendMessage(key, openaiChatMessage{Role: "assistant", Content: fullText})
 
-	meta := &messageMeta{
+	var meta *messageMeta
+	// Always include meta with duration; include token counts if available.
+	meta = &messageMeta{
 		DurationMs:          duration.Milliseconds(),
 		Model:               model,
 		InputTokens:         usage.PromptTokens,
