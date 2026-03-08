@@ -19,9 +19,14 @@ import (
 // StreamFunc is called with each streaming delta chunk. If nil, no streaming.
 type StreamFunc func(delta siMessage)
 
+// RunOpts configures a backend run.
+type RunOpts struct {
+	WorkDir string // override working directory (e.g., forge slot path)
+}
+
 // Backend executes agent tasks.
 type Backend interface {
-	Run(ctx context.Context, agent string, msg siMessage, inject <-chan siMessage, onStream StreamFunc) (siMessage, []spawnRequest)
+	Run(ctx context.Context, agent string, msg siMessage, inject <-chan siMessage, onStream StreamFunc, opts RunOpts) (siMessage, []spawnRequest)
 }
 
 // BackendConfig defines a backend in the config file.
@@ -119,7 +124,7 @@ type CLIBackend struct {
 	timeout time.Duration
 }
 
-func (b *CLIBackend) Run(ctx context.Context, agent string, msg siMessage, injectCh <-chan siMessage, onStream StreamFunc) (siMessage, []spawnRequest) {
+func (b *CLIBackend) Run(ctx context.Context, agent string, msg siMessage, injectCh <-chan siMessage, onStream StreamFunc, opts RunOpts) (siMessage, []spawnRequest) {
 	// Build command with {agent} placeholder replacement.
 	args := make([]string, len(b.cmd))
 	for i, a := range b.cmd {
@@ -132,7 +137,9 @@ func (b *CLIBackend) Run(ctx context.Context, agent string, msg siMessage, injec
 
 	start := time.Now()
 	cmd := exec.CommandContext(cmdCtx, expandHome(args[0]), args[1:]...)
-	if dir != "" {
+	if opts.WorkDir != "" {
+		cmd.Dir = opts.WorkDir
+	} else if dir != "" {
 		cmd.Dir = expandHome(dir)
 	}
 	cmd.Env = append(os.Environ(), b.env...)
@@ -273,7 +280,7 @@ type HTTPBackend struct {
 	client  *http.Client
 }
 
-func (b *HTTPBackend) Run(ctx context.Context, agent string, msg siMessage, _ <-chan siMessage, _ StreamFunc) (siMessage, []spawnRequest) {
+func (b *HTTPBackend) Run(ctx context.Context, agent string, msg siMessage, _ <-chan siMessage, _ StreamFunc, _ RunOpts) (siMessage, []spawnRequest) {
 	reqBody := struct {
 		Text    string `json:"text"`
 		Agent   string `json:"agent"`
@@ -398,7 +405,7 @@ func (b *OpenAIBackend) getHistory(key string) []openaiChatMessage {
 	return out
 }
 
-func (b *OpenAIBackend) Run(ctx context.Context, agent string, msg siMessage, _ <-chan siMessage, onStream StreamFunc) (siMessage, []spawnRequest) {
+func (b *OpenAIBackend) Run(ctx context.Context, agent string, msg siMessage, _ <-chan siMessage, onStream StreamFunc, _ RunOpts) (siMessage, []spawnRequest) {
 	backendAgent := b.resolveAgentID(agent)
 
 	content := msg.Text

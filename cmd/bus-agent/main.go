@@ -146,6 +146,7 @@ type BusAgent struct {
 	consumer      string
 	backends      map[string]Backend
 	registry      *AgentRegistry
+	forge         *ForgeManager
 	http          *http.Client
 	defaultTarget AgentTarget
 
@@ -249,12 +250,16 @@ func main() {
 		cancel()
 	}()
 
+	forgeMgr := NewForgeManager()
+	defer forgeMgr.Close()
+
 	ba := &BusAgent{
 		busURL:        *busURL,
 		token:         *token,
 		consumer:      *consumer,
 		backends:      backends,
 		registry:      registry,
+		forge:         forgeMgr,
 		http:          &http.Client{Timeout: 10 * time.Second},
 		defaultTarget: defaultTarget,
 		queues:        make(map[QueueKey]*agentQueue),
@@ -323,6 +328,19 @@ func (ba *BusAgent) runQueue(q *agentQueue) {
 				continue
 			}
 
+			// Acquire forge slot for isolated work.
+			var runOpts RunOpts
+			var slotKey string
+			if cliBackend, ok := backend.(*CLIBackend); ok && cliBackend.dir != "" {
+				repoRoot := expandHome(replaceVars(cliBackend.dir, task.target.Name))
+				sessionID := fmt.Sprintf("%s-%d", task.target.Name, time.Now().UnixMilli())
+				slotPath, key := ba.forge.Acquire(task.target.Name, sessionID, repoRoot)
+				if slotPath != "" {
+					runOpts.WorkDir = slotPath
+					slotKey = key
+				}
+			}
+
 			// Create injection channel for this run.
 			inject := make(chan siMessage, 10)
 			q.mu.Lock()
@@ -336,7 +354,7 @@ func (ba *BusAgent) runQueue(q *agentQueue) {
 				ba.publish(delta)
 			}
 
-			resp, spawns := backend.Run(ba.ctx, task.target.Name, task.msg, inject, onStream)
+			resp, spawns := backend.Run(ba.ctx, task.target.Name, task.msg, inject, onStream, runOpts)
 
 			// Clear injection state and re-queue any unread injected messages.
 			q.mu.Lock()
@@ -351,6 +369,9 @@ func (ba *BusAgent) runQueue(q *agentQueue) {
 					task.target.Name, task.target.Orchestrator, truncate(leftover.Text, 60))
 				q.ch <- agentTask{msg: leftover, target: task.target}
 			}
+
+			// Release forge slot after run completes.
+			ba.forge.Release(slotKey)
 
 			ba.publish(resp)
 
