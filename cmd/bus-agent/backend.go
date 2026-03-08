@@ -409,8 +409,12 @@ func (b *OpenAIBackend) Run(ctx context.Context, agent string, msg siMessage, _ 
 
 	history := b.getHistory(key)
 
-	// Use streaming if callback is provided and not explicitly disabled.
-	useStream := onStream != nil && !b.noStream
+	// Streaming strategy:
+	// - If backend supports SSE streaming natively (not noStream): use real SSE
+	// - If noStream but onStream callback exists: use simulated streaming
+	//   (non-streaming request, then emit text in chunks)
+	useSSE := onStream != nil && !b.noStream
+	simulateStream := onStream != nil && b.noStream
 
 	type streamOpts struct {
 		IncludeUsage bool `json:"include_usage"`
@@ -423,9 +427,9 @@ func (b *OpenAIBackend) Run(ctx context.Context, agent string, msg siMessage, _ 
 	}{
 		Model:    b.model,
 		Messages: history,
-		Stream:   useStream,
+		Stream:   useSSE,
 	}
-	if useStream {
+	if useSSE {
 		reqBody.StreamOptions = &streamOpts{IncludeUsage: true}
 	}
 	data, _ := json.Marshal(reqBody)
@@ -464,8 +468,8 @@ func (b *OpenAIBackend) Run(ctx context.Context, agent string, msg siMessage, _ 
 	var model string
 	var usage openaiUsage
 
-	if useStream {
-		// SSE streaming: read "data: {...}" lines.
+	if useSSE {
+		// Real SSE streaming: read "data: {...}" lines.
 		streamID := fmt.Sprintf("s-%d", start.UnixMilli())
 		log.Printf("[%s] streaming started for %s (streamID=%s)", b.name, agent, streamID)
 		scanner := bufio.NewScanner(resp.Body)
@@ -473,7 +477,7 @@ func (b *OpenAIBackend) Run(ctx context.Context, agent string, msg siMessage, _ 
 		for scanner.Scan() {
 			line := scanner.Text()
 			if line == "" {
-				continue // SSE blank line separator
+				continue
 			}
 			if !strings.HasPrefix(line, "data: ") {
 				continue
@@ -493,7 +497,6 @@ func (b *OpenAIBackend) Run(ctx context.Context, agent string, msg siMessage, _ 
 				model = chunk.Model
 			}
 
-			// Extract usage from final chunk (OpenAI includes it in the last chunk).
 			if chunk.Usage.PromptTokens > 0 || chunk.Usage.CompletionTokens > 0 {
 				usage = chunk.Usage
 			}
@@ -520,7 +523,7 @@ func (b *OpenAIBackend) Run(ctx context.Context, agent string, msg siMessage, _ 
 			log.Printf("[%s] scanner error: %v", b.name, err)
 		}
 	} else {
-		// Non-streaming: read full response.
+		// Non-streaming request (also used as base for simulated streaming).
 		body, _ := io.ReadAll(resp.Body)
 		var result openaiChatCompletion
 		if err := json.Unmarshal(body, &result); err != nil {
@@ -531,6 +534,29 @@ func (b *OpenAIBackend) Run(ctx context.Context, agent string, msg siMessage, _ 
 		}
 		model = result.Model
 		usage = result.Usage
+
+		// Simulated streaming: emit the full text as rapid deltas.
+		if simulateStream && fullText != "" {
+			streamID := fmt.Sprintf("s-%d", start.UnixMilli())
+			// Split into word-boundary chunks for natural streaming feel.
+			words := strings.Fields(fullText)
+			for i, word := range words {
+				chunk := word
+				if i < len(words)-1 {
+					chunk += " "
+				}
+				onStream(siMessage{
+					Text:         chunk,
+					Channel:      msg.Channel,
+					Agent:        agent,
+					Author:       agent,
+					Orchestrator: b.name,
+					Stream:       "delta",
+					StreamID:     streamID,
+					Timestamp:    time.Now(),
+				})
+			}
+		}
 	}
 
 	duration := time.Since(start)
@@ -552,10 +578,10 @@ func (b *OpenAIBackend) Run(ctx context.Context, agent string, msg siMessage, _ 
 		b.name, msg.Channel, agent, truncate(fullText, 80), duration.Seconds(), len(history))
 
 	stream := ""
-	streamID := ""
-	if useStream {
+	finalStreamID := ""
+	if useSSE || simulateStream {
 		stream = "done"
-		streamID = fmt.Sprintf("s-%d", start.UnixMilli())
+		finalStreamID = fmt.Sprintf("s-%d", start.UnixMilli())
 	}
 
 	return siMessage{
@@ -565,7 +591,7 @@ func (b *OpenAIBackend) Run(ctx context.Context, agent string, msg siMessage, _ 
 		Author:       agent,
 		Orchestrator: b.name,
 		Stream:       stream,
-		StreamID:     streamID,
+		StreamID:     finalStreamID,
 		Timestamp:    time.Now(),
 		Meta:         meta,
 	}, nil
