@@ -338,6 +338,18 @@ func (ba *BusAgent) runQueue(q *agentQueue) {
 				if slotPath != "" {
 					runOpts.WorkDir = slotPath
 					slotKey = key
+				} else {
+					// No slot available — wait for one to free up
+					log.Printf("[bus-agent] %s/%s: waiting for forge slot...",
+						task.target.Name, task.target.Orchestrator)
+					if ba.forge.WaitForSlot(ba.ctx) {
+						// Retry acquisition
+						slotPath, key = ba.forge.Acquire(task.target.Name, sessionID, repoRoot)
+						if slotPath != "" {
+							runOpts.WorkDir = slotPath
+							slotKey = key
+						}
+					}
 				}
 			}
 
@@ -598,6 +610,7 @@ func (ba *BusAgent) serveAPI() {
 	mux.HandleFunc("/api/models/test", ba.handleModelTest)
 	mux.HandleFunc("/api/models/toggle", ba.handleModelToggle)
 	mux.HandleFunc("/api/models", ba.handleModelsStatus)
+	mux.HandleFunc("/api/forge", ba.handleForgeStatus)
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
@@ -607,6 +620,17 @@ func (ba *BusAgent) serveAPI() {
 	if err := http.ListenAndServe(":"+port, mux); err != nil {
 		log.Printf("[bus-agent] API server error: %v", err)
 	}
+}
+
+func (ba *BusAgent) handleForgeStatus(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	status := ba.forge.Status()
+	if status == nil {
+		status = []ProjectStatus{}
+	}
+	json.NewEncoder(w).Encode(status)
 }
 
 func (ba *BusAgent) handleModelTest(w http.ResponseWriter, r *http.Request) {
