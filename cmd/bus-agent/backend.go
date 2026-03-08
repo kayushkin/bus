@@ -40,6 +40,7 @@ type BackendConfig struct {
 	AgentMap    map[string]string `json:"agent_map,omitempty"`    // OpenAI: bus name → backend agent ID (e.g. "claxon" → "main")
 	SessionKey  string            `json:"session_key,omitempty"`  // OpenAI: session key template. {agent} = mapped agent ID. Sent as x-openclaw-session-key.
 	NoStream    bool              `json:"no_stream,omitempty"`    // OpenAI: disable streaming (for backends that don't support usage in stream)
+	UsageFile   string            `json:"usage_file,omitempty"`   // OpenAI: JSON file to read usage from after streaming (e.g. sessions.json)
 }
 
 // NewBackend creates a Backend from config.
@@ -92,6 +93,7 @@ func NewBackend(name string, cfg BackendConfig) (Backend, error) {
 			agentMap:       cfg.AgentMap,
 			sessionKeyTmpl: cfg.SessionKey,
 			noStream:       cfg.NoStream,
+			usageFile:      expandHome(cfg.UsageFile),
 			timeout:        timeout,
 			client:         &http.Client{Timeout: timeout},
 		}, nil
@@ -346,6 +348,7 @@ type OpenAIBackend struct {
 	agentMap       map[string]string // bus agent name → backend agent ID
 	sessionKeyTmpl string            // session key template ({agent} = mapped ID)
 	noStream       bool              // disable streaming (backend doesn't support usage in stream)
+	usageFile      string            // JSON file with session usage (read after streaming)
 	timeout        time.Duration
 	client         *http.Client
 
@@ -522,6 +525,20 @@ func (b *OpenAIBackend) Run(ctx context.Context, agent string, msg siMessage, _ 
 		if err := scanner.Err(); err != nil {
 			log.Printf("[%s] scanner error: %v", b.name, err)
 		}
+
+		// If SSE didn't provide usage but we have a usage file, read it.
+		if usage.PromptTokens == 0 && usage.CompletionTokens == 0 && b.usageFile != "" {
+			sessionKey := ""
+			if b.sessionKeyTmpl != "" {
+				sessionKey = strings.ReplaceAll(b.sessionKeyTmpl, "{agent}", backendAgent)
+			}
+			if sessionKey != "" {
+				if u, ok := readUsageFromFile(b.usageFile, sessionKey); ok {
+					usage = u
+					log.Printf("[%s] usage from file: in=%d out=%d", b.name, usage.PromptTokens, usage.CompletionTokens)
+				}
+			}
+		}
 	} else {
 		// Non-streaming request (also used as base for simulated streaming).
 		body, _ := io.ReadAll(resp.Body)
@@ -631,6 +648,32 @@ type openaiStreamChunk struct {
 		FinishReason *string `json:"finish_reason"`
 	} `json:"choices"`
 	Usage openaiUsage `json:"usage"`
+}
+
+// readUsageFromFile reads session usage from a JSON file (e.g. OpenClaw's sessions.json).
+// The file maps session keys to objects with inputTokens/outputTokens.
+func readUsageFromFile(path, sessionKey string) (openaiUsage, bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return openaiUsage{}, false
+	}
+	var store map[string]struct {
+		InputTokens  int `json:"inputTokens"`
+		OutputTokens int `json:"outputTokens"`
+		TotalTokens  int `json:"totalTokens"`
+	}
+	if err := json.Unmarshal(data, &store); err != nil {
+		return openaiUsage{}, false
+	}
+	entry, ok := store[sessionKey]
+	if !ok {
+		return openaiUsage{}, false
+	}
+	return openaiUsage{
+		PromptTokens:     entry.InputTokens,
+		CompletionTokens: entry.OutputTokens,
+		TotalTokens:      entry.TotalTokens,
+	}, true
 }
 
 // --- parse helpers (used by CLIBackend) ---
