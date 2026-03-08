@@ -115,7 +115,7 @@ type CLIBackend struct {
 	timeout time.Duration
 }
 
-func (b *CLIBackend) Run(ctx context.Context, agent string, msg siMessage, injectCh <-chan siMessage, _ StreamFunc) (siMessage, []spawnRequest) {
+func (b *CLIBackend) Run(ctx context.Context, agent string, msg siMessage, injectCh <-chan siMessage, onStream StreamFunc) (siMessage, []spawnRequest) {
 	// Build command with {agent} placeholder replacement.
 	args := make([]string, len(b.cmd))
 	for i, a := range b.cmd {
@@ -176,9 +176,41 @@ func (b *CLIBackend) Run(ctx context.Context, agent string, msg siMessage, injec
 		stdinPipe.Close()
 	}
 
+	// Read stderr incrementally for streaming deltas.
+	var stderrLines []string
+	streamID := fmt.Sprintf("s-%d", start.UnixMilli())
+	stderrDone := make(chan struct{})
+	go func() {
+		defer close(stderrDone)
+		scanner := bufio.NewScanner(stderrPipe)
+		scanner.Buffer(make([]byte, 256*1024), 256*1024)
+		for scanner.Scan() {
+			line := scanner.Text()
+			if strings.HasPrefix(line, "INBER_DELTA:") && onStream != nil {
+				delta := strings.TrimPrefix(line, "INBER_DELTA:")
+				// Decode escaped newlines
+				delta = strings.ReplaceAll(delta, "\\n", "\n")
+				delta = strings.ReplaceAll(delta, "\\r", "\r")
+				onStream(siMessage{
+					Text:         delta,
+					Channel:      msg.Channel,
+					Agent:        agent,
+					Author:       agent,
+					Orchestrator: b.name,
+					Stream:       "delta",
+					StreamID:     streamID,
+					Timestamp:    time.Now(),
+				})
+			} else {
+				stderrLines = append(stderrLines, line)
+			}
+		}
+	}()
+
 	rawOutput, _ := io.ReadAll(stdout)
 	output := stripANSI(rawOutput)
-	errData, _ := io.ReadAll(stderrPipe)
+
+	<-stderrDone // wait for stderr scanner to finish
 
 	if b.inject {
 		stdinPipe.Close()
@@ -186,7 +218,7 @@ func (b *CLIBackend) Run(ctx context.Context, agent string, msg siMessage, injec
 	cmd.Wait()
 
 	duration := time.Since(start)
-	stderrStr := string(errData)
+	stderrStr := strings.Join(stderrLines, "\n")
 
 	text := strings.TrimSpace(string(output))
 	if text == "" && stderrStr != "" {
@@ -206,12 +238,20 @@ func (b *CLIBackend) Run(ctx context.Context, agent string, msg siMessage, injec
 	log.Printf("[%s] → [%s] %s: %s (%.1fs)",
 		b.name, msg.Channel, agent, truncate(text, 80), duration.Seconds())
 
+	// If we streamed, mark the final message as "done"
+	stream := ""
+	if onStream != nil {
+		stream = "done"
+	}
+
 	return siMessage{
 		Text:         text,
 		Channel:      msg.Channel,
 		Agent:        agent,
 		Author:       agent,
 		Orchestrator: b.name,
+		Stream:       stream,
+		StreamID:     streamID,
 		Timestamp:    time.Now(),
 		Meta:         parsedMeta,
 	}, parsedSpawns
