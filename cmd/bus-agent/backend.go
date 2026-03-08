@@ -310,7 +310,6 @@ type OpenAIBackend struct {
 const maxConvoMessages = 100 // keep last N messages per conversation
 
 // resolveAgentID maps a bus agent name to the backend's agent ID.
-// Falls back to the bus name if no mapping exists.
 func (b *OpenAIBackend) resolveAgentID(busName string) string {
 	if b.agentMap != nil {
 		if mapped, ok := b.agentMap[busName]; ok {

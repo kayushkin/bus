@@ -25,6 +25,7 @@ import (
 
 	"github.com/gorilla/websocket"
 	modelstore "github.com/kayushkin/model-store"
+	_ "github.com/mattn/go-sqlite3"
 )
 
 // --- config ---
@@ -123,12 +124,12 @@ type spawnRequest struct {
 
 type agentTask struct {
 	msg          siMessage
-	orchestrator string // explicit orchestrator (from spawn or registry)
+	target       AgentTarget // resolved (name, orchestrator) pair
 }
 
 type agentQueue struct {
-	name string
-	ch   chan agentTask
+	target AgentTarget
+	ch     chan agentTask
 
 	mu      sync.Mutex
 	running bool
@@ -138,15 +139,15 @@ type agentQueue struct {
 // --- bus agent ---
 
 type BusAgent struct {
-	busURL   string
-	token    string
-	consumer string
-	config   *Config
-	backends map[string]Backend
-	registry *AgentRegistry
-	http     *http.Client
+	busURL        string
+	token         string
+	consumer      string
+	backends      map[string]Backend
+	registry      *AgentRegistry
+	http          *http.Client
+	defaultTarget AgentTarget
 
-	queues   map[string]*agentQueue
+	queues   map[QueueKey]*agentQueue
 	queuesMu sync.Mutex
 	ctx      context.Context
 	wg       sync.WaitGroup
@@ -156,103 +157,83 @@ func main() {
 	busURL := flag.String("bus", envOr("BUS_URL", "http://localhost:8100"), "bus URL")
 	token := flag.String("token", envOr("BUS_TOKEN", ""), "bus auth token")
 	consumer := flag.String("consumer", envOr("BUS_CONSUMER", "bus-agent-wsl"), "consumer ID")
-	configFile := flag.String("config", envOr("BUS_AGENT_CONFIG", ""), "config file path")
-
-	// Legacy flags — used when no config file is provided.
-	inberBin := flag.String("inber", envOr("INBER_BIN", os.ExpandEnv("$HOME/bin/inber")), "inber binary path")
-	inberDir := flag.String("dir", envOr("INBER_DIR", os.ExpandEnv("$HOME/life/repos/inber")), "inber working directory")
-	defaultAgent := flag.String("agent", envOr("BUS_DEFAULT_AGENT", "claxon"), "default agent")
-	routesFile := flag.String("routes", envOr("BUS_ROUTES", ""), "channel routes JSON file (legacy)")
+	dbPath := flag.String("db", envOr("BUS_AGENT_DB", "~/.config/bus-agent/agents.db"), "registry database path")
+	syncAgents := flag.Bool("sync", false, "sync agents from backends on startup")
+	syncInterval := flag.Duration("sync-interval", 0, "periodic sync interval (e.g., '10m'), 0=disabled")
 	flag.Parse()
 
-	// Load or build config.
-	var cfg Config
-	if *configFile != "" {
-		data, err := os.ReadFile(*configFile)
-		if err != nil {
-			log.Fatalf("[bus-agent] failed to read config: %v", err)
-		}
-		// Expand ${VAR} references in config before parsing.
-		data = []byte(os.ExpandEnv(string(data)))
-		if err := json.Unmarshal(data, &cfg); err != nil {
-			log.Fatalf("[bus-agent] failed to parse config: %v", err)
-		}
-		log.Printf("[bus-agent] loaded config: %d backends, %d routes", len(cfg.Backends), len(cfg.Routes))
-	} else {
-		// Build implicit config from legacy CLI flags.
-		cfg = Config{
-			Backends: map[string]BackendConfig{
-				"inber": {
-					Type:     "cli",
-					Cmd:      []string{*inberBin, "run", "-a", "{agent}"},
-					Dir:      *inberDir,
-					Stdin:    "json",
-					Features: []string{"meta", "spawns", "inject"},
-				},
-			},
-			DefaultBackend: "inber",
-			DefaultAgent:   *defaultAgent,
-		}
-
-		// Load legacy routes file.
-		if *routesFile != "" {
-			var routes []struct {
-				Prefix string `json:"prefix"`
-				Agent  string `json:"agent"`
-			}
-			data, err := os.ReadFile(*routesFile)
-			if err != nil {
-				log.Fatalf("[bus-agent] failed to read routes: %v", err)
-			}
-			if err := json.Unmarshal(data, &routes); err != nil {
-				log.Fatalf("[bus-agent] failed to parse routes: %v", err)
-			}
-			for _, r := range routes {
-				cfg.Routes = append(cfg.Routes, RouteConfig{
-					Channel: r.Prefix,
-					Agent:   r.Agent,
-				})
-			}
-			log.Printf("[bus-agent] loaded %d legacy routes", len(routes))
-		}
-	}
-
-	// Initialize backends.
-	backends := make(map[string]Backend)
-	for name, bcfg := range cfg.Backends {
-		b, err := NewBackend(name, bcfg)
-		if err != nil {
-			log.Fatalf("[bus-agent] failed to create backend %q: %v", name, err)
-		}
-		backends[name] = b
-		log.Printf("[bus-agent] backend %q (%s) ready", name, bcfg.Type)
-	}
-	if _, ok := backends[cfg.DefaultBackend]; !ok {
-		log.Fatalf("[bus-agent] default backend %q not found in config", cfg.DefaultBackend)
-	}
-
-	// Open agent registry DB.
-	dbPath := cfg.RegistryDB
-	if dbPath == "" {
-		dbPath = expandHome("~/.config/bus-agent/agents.db")
-	}
-	registry, err := OpenRegistry(dbPath)
+	// Open registry DB (single source of truth).
+	registry, err := OpenRegistry(expandHome(*dbPath))
 	if err != nil {
-		log.Fatalf("[bus-agent] failed to open agent registry: %v", err)
+		log.Fatalf("[bus-agent] failed to open registry: %v", err)
 	}
 	defer registry.Close()
 
-	// Seed registry from config (only adds agents not already in DB).
-	for name, orch := range cfg.Agents {
-		if _, err := registry.Get(name, orch); err != nil {
-			registry.Set(AgentEntry{Name: name, Orchestrator: orch, Enabled: true})
-			log.Printf("[bus-agent] seeded agent %q → %s", name, orch)
+	// Sync agents from backends if requested
+	if *syncAgents || *syncInterval > 0 {
+		added, updated, removed, err := registry.SyncAllAgents()
+		if err != nil {
+			log.Printf("[bus-agent] agent sync error: %v", err)
+		} else if added+updated+removed > 0 {
+			log.Printf("[bus-agent] synced agents: +%d, ~%d, -%d", added, updated, removed)
 		}
 	}
 
-	// Log registered agents.
-	if agents, err := registry.List(); err == nil && len(agents) > 0 {
-		log.Printf("[bus-agent] %d agents registered", len(agents))
+	// Periodic sync
+	if *syncInterval > 0 {
+		go func() {
+			ticker := time.NewTicker(*syncInterval)
+			defer ticker.Stop()
+			for range ticker.C {
+				added, updated, removed, err := registry.SyncAllAgents()
+				if err != nil {
+					log.Printf("[bus-agent] periodic sync error: %v", err)
+				} else if added+updated+removed > 0 {
+					log.Printf("[bus-agent] periodic sync: +%d, ~%d, -%d", added, updated, removed)
+				}
+			}
+		}()
+	}
+
+	// Load backends from DB.
+	backendEntries, err := registry.ListBackends()
+	if err != nil {
+		log.Fatalf("[bus-agent] failed to load backends: %v", err)
+	}
+	backends := make(map[string]Backend)
+	for _, be := range backendEntries {
+		b, err := NewBackend(be.Name, be.Config)
+		if err != nil {
+			log.Printf("[bus-agent] warning: failed to create backend %q: %v", be.Name, err)
+			continue
+		}
+		backends[be.Name] = b
+		log.Printf("[bus-agent] backend %q (%s) ready", be.Name, be.Type)
+	}
+	if len(backends) == 0 {
+		log.Fatalf("[bus-agent] no backends configured in DB")
+	}
+
+	// Load agents and routes from DB.
+	agents, err := registry.ListAgents()
+	if err != nil {
+		log.Fatalf("[bus-agent] failed to load agents: %v", err)
+	}
+	log.Printf("[bus-agent] %d agents registered", len(agents))
+
+	routes, err := registry.ListRoutes()
+	if err != nil {
+		log.Printf("[bus-agent] warning: failed to load routes: %v", err)
+	}
+	log.Printf("[bus-agent] %d routes configured", len(routes))
+
+	// Find default agent target (first enabled agent, or claxon/inber).
+	defaultTarget := AgentTarget{Name: "claxon", Orchestrator: "inber"}
+	for _, a := range agents {
+		if a.Enabled {
+			defaultTarget = AgentTarget{Name: a.Name, Orchestrator: a.Orchestrator}
+			break
+		}
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -267,15 +248,15 @@ func main() {
 	}()
 
 	ba := &BusAgent{
-		busURL:   *busURL,
-		token:    *token,
-		consumer: *consumer,
-		config:   &cfg,
-		backends: backends,
-		registry: registry,
-		http:     &http.Client{Timeout: 10 * time.Second},
-		queues:   make(map[string]*agentQueue),
-		ctx:      ctx,
+		busURL:        *busURL,
+		token:         *token,
+		consumer:      *consumer,
+		backends:      backends,
+		registry:      registry,
+		http:          &http.Client{Timeout: 10 * time.Second},
+		defaultTarget: defaultTarget,
+		queues:        make(map[QueueKey]*agentQueue),
+		ctx:           ctx,
 	}
 
 	go ba.serveAPI()
@@ -283,74 +264,62 @@ func main() {
 	ba.wg.Wait()
 }
 
-// resolveAgent returns the agent name for a given channel.
-func (ba *BusAgent) resolveAgent(channel string) string {
-	for _, r := range ba.config.Routes {
-		if r.Channel != "" && !strings.HasPrefix(channel, r.Channel) {
-			continue
-		}
-		if r.Agent != "" {
-			return r.Agent
-		}
+// resolveTarget returns the agent target for a channel from the routes table.
+func (ba *BusAgent) resolveTarget(channel string) AgentTarget {
+	if target, ok := ba.registry.ResolveRoute(channel); ok {
+		return target
 	}
-	return ba.config.DefaultAgent
+	return ba.defaultTarget
 }
 
-// resolveBackend returns the backend for an agent.
-// Priority: explicit orchestrator → registry DB → default backend.
-func (ba *BusAgent) resolveBackend(agent, orchestrator string) Backend {
-	// 1. Explicit orchestrator from spawn request or message.
-	if orchestrator != "" {
-		if b, ok := ba.backends[orchestrator]; ok {
-			return b
-		}
-		log.Printf("[bus-agent] unknown orchestrator %q for agent %q, falling back", orchestrator, agent)
+// getBackend returns the backend for a given orchestrator name.
+func (ba *BusAgent) getBackend(orchestrator string) Backend {
+	if b, ok := ba.backends[orchestrator]; ok {
+		return b
 	}
-
-	// 2. Registry DB lookup.
-	if ba.registry != nil {
-		if orch, ok := ba.registry.Resolve(agent); ok {
-			if b, ok := ba.backends[orch]; ok {
-				return b
-			}
-		}
-	}
-
-	// 3. Default backend.
-	return ba.backends[ba.config.DefaultBackend]
+	log.Printf("[bus-agent] unknown orchestrator %q", orchestrator)
+	return nil
 }
 
-// getOrCreateQueue returns the queue for an agent, creating one if needed.
-func (ba *BusAgent) getOrCreateQueue(name string) *agentQueue {
+// getOrCreateQueue returns the queue for an agent target, creating one if needed.
+func (ba *BusAgent) getOrCreateQueue(target AgentTarget) *agentQueue {
+	key := QueueKey{Name: target.Name, Orchestrator: target.Orchestrator}
+
 	ba.queuesMu.Lock()
 	defer ba.queuesMu.Unlock()
 
-	if q, ok := ba.queues[name]; ok {
+	if q, ok := ba.queues[key]; ok {
 		return q
 	}
 
 	q := &agentQueue{
-		name: name,
-		ch:   make(chan agentTask, 100),
+		target: target,
+		ch:     make(chan agentTask, 100),
 	}
-	ba.queues[name] = q
+	ba.queues[key] = q
 
 	ba.wg.Add(1)
 	go ba.runQueue(q)
-	log.Printf("[bus-agent] created queue for agent %q", name)
+	log.Printf("[bus-agent] created queue: %s/%s", target.Name, target.Orchestrator)
 
 	return q
 }
 
-// runQueue processes tasks for a single agent sequentially,
-// dispatching each to the appropriate backend.
+// runQueue processes tasks for a single agent sequentially.
 func (ba *BusAgent) runQueue(q *agentQueue) {
 	defer ba.wg.Done()
 
 	for {
 		select {
 		case task := <-q.ch:
-			backend := ba.resolveBackend(q.name, task.orchestrator)
+			log.Printf("[bus-agent] %s/%s: dequeued (text=%q)",
+				task.target.Name, task.target.Orchestrator, truncate(task.msg.Text, 60))
+
+			backend := ba.getBackend(task.target.Orchestrator)
+			if backend == nil {
+				log.Printf("[bus-agent] %s/%s: no backend!", task.target.Name, task.target.Orchestrator)
+				continue
+			}
 
 			// Create injection channel for this run.
 			inject := make(chan siMessage, 10)
@@ -359,7 +328,7 @@ func (ba *BusAgent) runQueue(q *agentQueue) {
 			q.inject = inject
 			q.mu.Unlock()
 
-			resp, spawns := backend.Run(ba.ctx, q.name, task.msg, inject)
+			resp, spawns := backend.Run(ba.ctx, task.target.Name, task.msg, inject)
 
 			// Clear injection state.
 			q.mu.Lock()
@@ -372,22 +341,29 @@ func (ba *BusAgent) runQueue(q *agentQueue) {
 
 			// Route spawn requests to target agent queues.
 			for _, s := range spawns {
-				s.Agent = strings.ToLower(s.Agent) // normalize — registry is source of truth
-				tq := ba.getOrCreateQueue(s.Agent)
+				s.Agent = strings.ToLower(s.Agent)
+				spawnOrch := s.Orchestrator
+				if spawnOrch == "" {
+					// Look up from registry; if ambiguous, use parent's orchestrator.
+					if a, ok := ba.registry.FindAgent(s.Agent); ok {
+						spawnOrch = a.Orchestrator
+					} else {
+						spawnOrch = task.target.Orchestrator
+					}
+				}
+				spawnTarget := AgentTarget{Name: s.Agent, Orchestrator: spawnOrch}
+				tq := ba.getOrCreateQueue(spawnTarget)
 				tq.ch <- agentTask{
 					msg: siMessage{
 						Text:      s.Task,
-						Channel:   task.msg.Channel, // inherit channel so response reaches user
-						Author:    "spawn:" + q.name,
+						Channel:   task.msg.Channel,
+						Author:    "spawn:" + task.target.Name,
 						Timestamp: time.Now(),
 					},
-					orchestrator: s.Orchestrator,
+					target: spawnTarget,
 				}
-				orch := s.Orchestrator
-				if orch == "" {
-					orch = "(registry)"
-				}
-				log.Printf("[bus-agent] spawn %s → %s@%s: %s", q.name, s.Agent, orch, truncate(s.Task, 60))
+				log.Printf("[bus-agent] spawn %s → %s/%s: %s",
+					task.target.Name, s.Agent, spawnOrch, truncate(s.Task, 60))
 			}
 
 		case <-ba.ctx.Done():
@@ -485,14 +461,25 @@ func (ba *BusAgent) subscribe() error {
 		log.Printf("[bus-agent] ← [%s] %s: %s",
 			siMsg.Channel, siMsg.Author, truncate(siMsg.Text, 80))
 
-		// Route to agent queue, or inject into running process.
-		// Message-level agent takes priority over channel-based routing.
-		// Normalize to lowercase — registry is the source of truth for names.
-		agentName := strings.ToLower(siMsg.Agent)
-		if agentName == "" {
-			agentName = ba.resolveAgent(siMsg.Channel)
+		// Resolve target: (agent name, orchestrator) pair.
+		var target AgentTarget
+		if siMsg.Agent != "" && siMsg.Orchestrator != "" {
+			// Both specified — use directly.
+			target = AgentTarget{Name: siMsg.Agent, Orchestrator: siMsg.Orchestrator}
+		} else if siMsg.Agent != "" {
+			// Agent name only — look up in registry.
+			if a, ok := ba.registry.FindAgent(siMsg.Agent); ok {
+				target = AgentTarget{Name: a.Name, Orchestrator: a.Orchestrator}
+			} else {
+				// Unknown agent, use default orchestrator.
+				target = AgentTarget{Name: siMsg.Agent, Orchestrator: ba.defaultTarget.Orchestrator}
+			}
+		} else {
+			// No agent specified — use channel route.
+			target = ba.resolveTarget(siMsg.Channel)
 		}
-		q := ba.getOrCreateQueue(agentName)
+
+		q := ba.getOrCreateQueue(target)
 
 		injected := false
 		q.mu.Lock()
@@ -500,16 +487,15 @@ func (ba *BusAgent) subscribe() error {
 			select {
 			case q.inject <- siMsg:
 				injected = true
-				log.Printf("[bus-agent] injected into running %s: %s",
-					agentName, truncate(siMsg.Text, 60))
+				log.Printf("[bus-agent] injected into %s/%s: %s",
+					target.Name, target.Orchestrator, truncate(siMsg.Text, 60))
 			default:
-				// Injection buffer full — queue as new task.
 			}
 		}
 		q.mu.Unlock()
 
 		if !injected {
-			q.ch <- agentTask{msg: siMsg, orchestrator: siMsg.Orchestrator}
+			q.ch <- agentTask{msg: siMsg, target: target}
 		}
 
 		ba.ack(msg.Topic, msg.ID)
@@ -570,6 +556,8 @@ func (ba *BusAgent) serveAPI() {
 	port := envOr("BUS_AGENT_API_PORT", "8101")
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("/api/credentials/toggle", ba.handleCredentialToggle)
+	mux.HandleFunc("/api/credentials", ba.handleCredentials)
 	mux.HandleFunc("/api/agents", ba.handleAgents)
 	mux.HandleFunc("/api/models/test", ba.handleModelTest)
 	mux.HandleFunc("/api/models/toggle", ba.handleModelToggle)
@@ -603,10 +591,25 @@ func (ba *BusAgent) handleModelTest(w http.ResponseWriter, r *http.Request) {
 
 	// Find the default CLI backend's binary for model testing.
 	var inberBin, inberDir string
-	if bcfg, ok := ba.config.Backends[ba.config.DefaultBackend]; ok && bcfg.Type == "cli" && len(bcfg.Cmd) > 0 {
-		inberBin = expandHome(bcfg.Cmd[0])
-		inberDir = expandHome(bcfg.Dir)
-	} else {
+	for _, be := range []string{"inber", ba.defaultTarget.Orchestrator} {
+		if bcfg, err := ba.registry.GetBackend(be); err == nil && bcfg.Type == "cli" && len(bcfg.Config.Cmd) > 0 {
+			inberBin = expandHome(bcfg.Config.Cmd[0])
+			inberDir = expandHome(bcfg.Config.Dir)
+			break
+		}
+	}
+	if inberBin == "" {
+		// Fallback: try any CLI backend
+		backends, _ := ba.registry.ListBackends()
+		for _, be := range backends {
+			if be.Type == "cli" && len(be.Config.Cmd) > 0 {
+				inberBin = expandHome(be.Config.Cmd[0])
+				inberDir = expandHome(be.Config.Dir)
+				break
+			}
+		}
+	}
+	if inberBin == "" {
 		http.Error(w, `{"error":"no CLI backend for model testing"}`, http.StatusBadRequest)
 		return
 	}
@@ -683,7 +686,7 @@ func (ba *BusAgent) handleAgents(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet:
-		agents, err := ba.registry.List()
+		agents, err := ba.registry.ListAgents()
 		if err != nil {
 			http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
 			return
@@ -704,7 +707,7 @@ func (ba *BusAgent) handleAgents(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, fmt.Sprintf(`{"error":"unknown orchestrator %q"}`, entry.Orchestrator), http.StatusBadRequest)
 			return
 		}
-		if err := ba.registry.Set(entry); err != nil {
+		if err := ba.registry.SetAgent(entry); err != nil {
 			http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
 			return
 		}
@@ -718,7 +721,7 @@ func (ba *BusAgent) handleAgents(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error":"name and orchestrator query params required"}`, http.StatusBadRequest)
 			return
 		}
-		if err := ba.registry.Delete(name, orchestrator); err != nil {
+		if err := ba.registry.DeleteAgent(name, orchestrator); err != nil {
 			http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusNotFound)
 			return
 		}
@@ -747,5 +750,171 @@ func (ba *BusAgent) handleModelsStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	json.NewEncoder(w).Encode(statuses)
+	// Build response with per-model credential info
+	type credRef struct {
+		ID           string `json:"id"`
+		Label        string `json:"label"`
+		AuthType     string `json:"auth_type"`
+		APIKeyMasked string `json:"api_key_masked,omitempty"`
+		TokenMasked  string `json:"token_masked,omitempty"`
+		Priority     int    `json:"priority"`
+		Enabled      bool   `json:"enabled"`
+		LastUsedAt   int64  `json:"last_used_at"`
+		ErrorCount   int    `json:"error_count"`
+		ExpiresAt    int64  `json:"expires_at"`
+	}
+
+	type modelWithCreds struct {
+		modelstore.ModelStatus
+		Credentials []credRef `json:"credentials"`
+	}
+
+	var result []modelWithCreds
+	for _, ms := range statuses {
+		mc := modelWithCreds{ModelStatus: ms}
+
+		creds, err := store.CredentialsForModel(ms.ID)
+		if err == nil && len(creds) > 0 {
+			for _, c := range creds {
+				cr := credRef{
+					ID:         c.ID,
+					Label:      c.Label,
+					AuthType:   c.AuthType,
+					Priority:   c.Priority,
+					Enabled:    c.Enabled,
+					LastUsedAt: c.LastUsedAt,
+					ErrorCount: c.ErrorCount,
+					ExpiresAt:  c.ExpiresAt,
+				}
+				if c.APIKey != "" {
+					cr.APIKeyMasked = maskKey(c.APIKey)
+				}
+				if c.Token != "" {
+					cr.TokenMasked = maskKey(c.Token)
+				}
+				mc.Credentials = append(mc.Credentials, cr)
+			}
+		}
+		if mc.Credentials == nil {
+			mc.Credentials = []credRef{}
+		}
+		result = append(result, mc)
+	}
+
+	json.NewEncoder(w).Encode(result)
+}
+
+// maskKey masks sensitive key/token values for display
+func maskKey(key string) string {
+	if len(key) <= 16 {
+		return strings.Repeat("*", len(key))
+	}
+	return key[:8] + "..." + key[len(key)-4:]
+}
+
+func (ba *BusAgent) handleCredentials(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	if r.Method != http.MethodGet {
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	store, err := modelstore.Open("")
+	if err != nil {
+		http.Error(w, `{"error":"failed to open model store"}`, http.StatusInternalServerError)
+		return
+	}
+	defer store.Close()
+
+	creds, err := store.ListCredentials("")
+	if err != nil {
+		http.Error(w, `{"error":"failed to query credentials"}`, http.StatusInternalServerError)
+		return
+	}
+
+	// Mask sensitive fields before sending
+	type credResponse struct {
+		ID           string `json:"id"`
+		Provider     string `json:"provider"`
+		Label        string `json:"label"`
+		AuthType     string `json:"auth_type"`
+		APIKeyMasked string `json:"api_key_masked,omitempty"`
+		TokenMasked  string `json:"token_masked,omitempty"`
+		BaseURL      string `json:"base_url,omitempty"`
+		Priority     int    `json:"priority"`
+		Enabled      bool   `json:"enabled"`
+		LastUsedAt   int64  `json:"last_used_at"`
+		LastError    string `json:"last_error,omitempty"`
+		LastErrorAt  int64  `json:"last_error_at"`
+		ErrorCount   int    `json:"error_count"`
+		ExpiresAt    int64  `json:"expires_at"`
+		CreatedAt    string `json:"created_at"`
+	}
+
+	var response []credResponse
+	for _, c := range creds {
+		cr := credResponse{
+			ID:          c.ID,
+			Provider:    c.Provider,
+			Label:       c.Label,
+			AuthType:    c.AuthType,
+			BaseURL:     c.BaseURL,
+			Priority:    c.Priority,
+			Enabled:     c.Enabled,
+			LastUsedAt:  c.LastUsedAt,
+			LastError:   c.LastError,
+			LastErrorAt: c.LastErrorAt,
+			ErrorCount:  c.ErrorCount,
+			ExpiresAt:   c.ExpiresAt,
+			CreatedAt:   c.CreatedAt,
+		}
+		if c.APIKey != "" {
+			cr.APIKeyMasked = maskKey(c.APIKey)
+		}
+		if c.Token != "" {
+			cr.TokenMasked = maskKey(c.Token)
+		}
+		response = append(response, cr)
+	}
+
+	if response == nil {
+		response = []credResponse{}
+	}
+	json.NewEncoder(w).Encode(response)
+}
+
+func (ba *BusAgent) handleCredentialToggle(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		ID      string `json:"id"`
+		Enabled bool   `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ID == "" {
+		http.Error(w, `{"error":"id required"}`, http.StatusBadRequest)
+		return
+	}
+
+	store, err := modelstore.Open("")
+	if err != nil {
+		http.Error(w, `{"error":"failed to open model store"}`, http.StatusInternalServerError)
+		return
+	}
+	defer store.Close()
+	store.EnableAuthProfileSync("")
+
+	if err := store.SetCredentialEnabled(req.ID, req.Enabled); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusBadRequest)
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "id": req.ID, "enabled": req.Enabled})
 }
