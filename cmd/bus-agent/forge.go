@@ -232,7 +232,7 @@ func gitHeadInfo(path string) (hash, msg string) {
 
 // gitDirtyStatus checks if a worktree has uncommitted changes.
 func gitDirtyStatus(path string) (dirty bool, fileCount int) {
-	cmd := exec.Command("git", "-C", path, "status", "--porcelain")
+	cmd := exec.Command("git", "-C", path, "status", "--porcelain", "-uno")
 	out, err := cmd.Output()
 	if err != nil {
 		return false, 0
