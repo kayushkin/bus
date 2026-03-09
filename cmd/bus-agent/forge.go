@@ -123,6 +123,7 @@ type SlotInfo struct {
 	UncommittedChanges string `json:"uncommitted_changes,omitempty"`
 	Ahead        int    `json:"ahead"`
 	Behind       int    `json:"behind"`
+	CommitTime   int64  `json:"commit_time,omitempty"`
 	Path         string `json:"path"`
 }
 
@@ -173,6 +174,7 @@ func (fm *ForgeManager) Status() []ProjectStatus {
 				si.UncommittedChanges = gitPorcelain(s.Path)
 			}
 			si.Ahead, si.Behind = gitAheadBehind(s.Path)
+			si.CommitTime = gitCommitTime(s.Path)
 
 			ps.Slots = append(ps.Slots, si)
 		}
@@ -378,6 +380,18 @@ func lastLines(s string, n int) string {
 		return strings.TrimSpace(s)
 	}
 	return strings.Join(lines[len(lines)-n:], "\n")
+}
+
+// gitCommitTime returns the unix timestamp of the HEAD commit.
+func gitCommitTime(path string) int64 {
+	cmd := exec.Command("git", "-C", path, "log", "-1", "--format=%ct")
+	out, err := cmd.Output()
+	if err != nil {
+		return 0
+	}
+	var t int64
+	fmt.Sscan(strings.TrimSpace(string(out)), &t)
+	return t
 }
 
 // gitAheadBehind returns how many commits ahead/behind origin/main a worktree is.
