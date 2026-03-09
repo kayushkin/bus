@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -49,7 +51,8 @@ func (fm *ForgeManager) AcquireByProject(agentName, sessionID, projectID string)
 		return "", ""
 	}
 
-	// Pull latest into slot
+	// Clean slot (reset to origin/main) then pull latest
+	fm.forge.CleanSlot(projectID, slot.ID)
 	fm.forge.SlotPull(projectID, slot.ID)
 
 	key := projectID + ":" + sessionID
@@ -233,3 +236,141 @@ func (fm *ForgeManager) Close() {
 		fm.forge.Close()
 	}
 }
+
+// DeployDev deploys a slot to its dev preview (build + serve).
+func (fm *ForgeManager) DeployDev(project string, slotID int, triggeredBy string) (int64, error) {
+	if fm.forge == nil {
+		return 0, fmt.Errorf("forge not available")
+	}
+
+	slots, err := fm.forge.SlotStatus(project)
+	if err != nil {
+		return 0, err
+	}
+	var slot *forge.Slot
+	for _, s := range slots {
+		if s.ID == slotID {
+			slot = &s
+			break
+		}
+	}
+	if slot == nil {
+		return 0, fmt.Errorf("slot %d not found for project %s", slotID, project)
+	}
+
+	hash, msg := gitHeadInfo(slot.Path)
+	branch := gitCurrentBranch(slot.Path)
+	target := fmt.Sprintf("dev-%d", slotID)
+
+	deployID, err := fm.forge.RecordDeploy(project, target, hash, msg, branch, triggeredBy)
+	if err != nil {
+		return 0, err
+	}
+
+	// Run deploy-dev.sh in background
+	go func() {
+		cmd := exec.Command(expandHome("~/bin/deploy-dev.sh"), fmt.Sprint(slotID), slot.Path)
+		cmd.Env = append(os.Environ(), fmt.Sprintf("SLOT_PATH=%s", slot.Path))
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			log.Printf("[forge] deploy dev-%d failed: %v\n%s", slotID, err, out)
+			fm.forge.FinishDeploy(deployID, false, fmt.Sprintf("%v: %s", err, lastLines(string(out), 5)))
+		} else {
+			log.Printf("[forge] deploy dev-%d success", slotID)
+			fm.forge.FinishDeploy(deployID, true, "")
+		}
+	}()
+
+	return deployID, nil
+}
+
+// DeployProd deploys to production.
+func (fm *ForgeManager) DeployProd(project, repoDir, triggeredBy string) (int64, error) {
+	if fm.forge == nil {
+		return 0, fmt.Errorf("forge not available")
+	}
+
+	hash, msg := gitHeadInfo(repoDir)
+	branch := gitCurrentBranch(repoDir)
+
+	deployID, err := fm.forge.RecordDeploy(project, "prod", hash, msg, branch, triggeredBy)
+	if err != nil {
+		return 0, err
+	}
+
+	go func() {
+		cmd := exec.Command(expandHome("~/bin/deploy-prod.sh"), repoDir)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			log.Printf("[forge] deploy prod failed: %v\n%s", err, out)
+			fm.forge.FinishDeploy(deployID, false, fmt.Sprintf("%v: %s", err, lastLines(string(out), 5)))
+		} else {
+			log.Printf("[forge] deploy prod success")
+			fm.forge.FinishDeploy(deployID, true, "")
+		}
+	}()
+
+	return deployID, nil
+}
+
+// DeployCommit checks out a specific commit in a slot and deploys it.
+func (fm *ForgeManager) DeployCommit(project string, slotID int, commitHash, triggeredBy string) (int64, error) {
+	if fm.forge == nil {
+		return 0, fmt.Errorf("forge not available")
+	}
+
+	slots, err := fm.forge.SlotStatus(project)
+	if err != nil {
+		return 0, err
+	}
+	var slot *forge.Slot
+	for _, s := range slots {
+		if s.ID == slotID {
+			slot = &s
+			break
+		}
+	}
+	if slot == nil {
+		return 0, fmt.Errorf("slot %d not found", slotID)
+	}
+
+	// Checkout the specific commit
+	cmd := exec.Command("git", "-C", slot.Path, "checkout", commitHash)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return 0, fmt.Errorf("git checkout %s: %v\n%s", commitHash, err, out)
+	}
+
+	return fm.DeployDev(project, slotID, triggeredBy)
+}
+
+// Deploys returns deploy history.
+func (fm *ForgeManager) Deploys(project, target string, limit int) ([]forge.Deploy, error) {
+	if fm.forge == nil {
+		return nil, fmt.Errorf("forge not available")
+	}
+	if project == "" {
+		return fm.forge.AllDeploys(limit)
+	}
+	return fm.forge.ListDeploys(project, target, limit)
+}
+
+// gitCurrentBranch returns the current branch name.
+func gitCurrentBranch(path string) string {
+	cmd := exec.Command("git", "-C", path, "rev-parse", "--abbrev-ref", "HEAD")
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// lastLines returns the last N lines of a string.
+func lastLines(s string, n int) string {
+	lines := strings.Split(strings.TrimSpace(s), "\n")
+	if len(lines) <= n {
+		return strings.TrimSpace(s)
+	}
+	return strings.Join(lines[len(lines)-n:], "\n")
+}
+
+// expandHome is in backend.go
