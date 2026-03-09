@@ -238,6 +238,7 @@ func (fm *ForgeManager) Close() {
 }
 
 // DeployDev deploys a slot to its dev preview (build + serve).
+// Auto-commits any dirty files before deploying so the commit hash is accurate.
 func (fm *ForgeManager) DeployDev(project string, slotID int, triggeredBy string) (int64, error) {
 	if fm.forge == nil {
 		return 0, fmt.Errorf("forge not available")
@@ -257,6 +258,9 @@ func (fm *ForgeManager) DeployDev(project string, slotID int, triggeredBy string
 	if slot == nil {
 		return 0, fmt.Errorf("slot %d not found for project %s", slotID, project)
 	}
+
+	// Auto-commit dirty files so deploy commit hash is accurate
+	autoCommitDirty(slot.Path, triggeredBy)
 
 	hash, msg := gitHeadInfo(slot.Path)
 	branch := gitCurrentBranch(slot.Path)
@@ -371,6 +375,37 @@ func lastLines(s string, n int) string {
 		return strings.TrimSpace(s)
 	}
 	return strings.Join(lines[len(lines)-n:], "\n")
+}
+
+// autoCommitDirty commits any uncommitted changes in a worktree.
+// Skips .inber/ session artifacts.
+func autoCommitDirty(path, triggeredBy string) {
+	// Check if dirty
+	cmd := exec.Command("git", "-C", path, "status", "--porcelain")
+	out, err := cmd.Output()
+	if err != nil || len(strings.TrimSpace(string(out))) == 0 {
+		return
+	}
+
+	// Add everything except .inber/
+	cmd = exec.Command("git", "-C", path, "add", "-A")
+	cmd.Run()
+	cmd = exec.Command("git", "-C", path, "reset", "HEAD", "--", ".inber/")
+	cmd.Run()
+
+	// Check if there's anything staged after excluding .inber
+	cmd = exec.Command("git", "-C", path, "diff", "--cached", "--quiet")
+	if cmd.Run() == nil {
+		return // nothing staged
+	}
+
+	msg := fmt.Sprintf("deploy: auto-commit by %s", triggeredBy)
+	cmd = exec.Command("git", "-C", path, "commit", "-m", msg)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		log.Printf("[forge] auto-commit failed: %v\n%s", err, out)
+	} else {
+		log.Printf("[forge] auto-committed dirty files in %s", path)
+	}
 }
 
 // expandHome is in backend.go
