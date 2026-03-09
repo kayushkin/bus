@@ -223,6 +223,32 @@ func gitPorcelain(path string) string {
 	return s
 }
 
+// AutoDeployIfDirty checks if a slot has uncommitted or new changes and auto-deploys to dev.
+func (fm *ForgeManager) AutoDeployIfDirty(slotKey, agentName string) {
+	if fm.forge == nil || slotKey == "" {
+		return
+	}
+
+	fm.mu.Lock()
+	slot, ok := fm.held[slotKey]
+	fm.mu.Unlock()
+	if !ok {
+		return
+	}
+
+	// Check if slot has any changes (committed ahead of main, or dirty files)
+	dirty, _ := gitDirtyStatus(slot.Path)
+	ahead, _ := gitAheadBehind(slot.Path)
+	if !dirty && ahead == 0 {
+		return
+	}
+
+	log.Printf("[forge] auto-deploying slot %d for %s (dirty=%v, ahead=%d)", slot.ID, agentName, dirty, ahead)
+	if _, err := fm.DeployDev(slot.Project, slot.ID, agentName); err != nil {
+		log.Printf("[forge] auto-deploy failed: %v", err)
+	}
+}
+
 // Close releases all held slots and closes the database.
 func (fm *ForgeManager) Close() {
 	fm.mu.Lock()

@@ -143,6 +143,7 @@ func (b *CLIBackend) Run(ctx context.Context, agent string, msg siMessage, injec
 		cmd.Dir = expandHome(dir)
 	}
 	cmd.Env = append(os.Environ(), b.env...)
+	cmd.Env = append(cmd.Env, "INBER_AGENT="+agent)
 
 	stdinPipe, err := cmd.StdinPipe()
 	if err != nil {

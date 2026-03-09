@@ -381,7 +381,10 @@ func (ba *BusAgent) runQueue(q *agentQueue) {
 				q.ch <- agentTask{msg: leftover, target: task.target}
 			}
 
-			// Release forge slot after run completes.
+			// Auto-deploy to dev preview if the agent made changes, then release slot.
+			if slotKey != "" {
+				ba.forge.AutoDeployIfDirty(slotKey, task.target.Name)
+			}
 			ba.forge.Release(slotKey)
 
 			ba.publish(resp)
