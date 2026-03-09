@@ -196,6 +196,21 @@ func (em *EnvironmentManager) Status() []EnvironmentInfo {
 	return result
 }
 
+// Close releases all held environments and closes the database.
+func (em *EnvironmentManager) Close() {
+	em.mu.Lock()
+	defer em.mu.Unlock()
+
+	// Release all held environments
+	for envID := range em.held {
+		em.forge.ReleaseEnvironment(envID)
+	}
+
+	if em.forge != nil {
+		em.forge.Close()
+	}
+}
+
 // DeployAll builds and deploys all services in an environment.
 func (em *EnvironmentManager) DeployAll(envID int, triggeredBy string) error {
 	if em.forge == nil {

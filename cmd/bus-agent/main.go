@@ -155,6 +155,7 @@ type BusAgent struct {
 	backends      map[string]Backend
 	registry      *AgentRegistry
 	forge         *ForgeManager
+	envManager    *EnvironmentManager
 	http          *http.Client
 	defaultTarget AgentTarget
 
@@ -261,6 +262,9 @@ func main() {
 	forgeMgr := NewForgeManager()
 	defer forgeMgr.Close()
 
+	envMgr := NewEnvironmentManager()
+	defer envMgr.Close()
+
 	ba := &BusAgent{
 		busURL:        *busURL,
 		token:         *token,
@@ -268,6 +272,7 @@ func main() {
 		backends:      backends,
 		registry:      registry,
 		forge:         forgeMgr,
+		envManager:    envMgr,
 		http:          &http.Client{Timeout: 10 * time.Second},
 		defaultTarget: defaultTarget,
 		queues:        make(map[QueueKey]*agentQueue),
@@ -624,6 +629,7 @@ func (ba *BusAgent) serveAPI() {
 	mux.HandleFunc("/api/forge/deploys", ba.handleForgeDeploys)
 	mux.HandleFunc("/api/forge/release", ba.handleForgeRelease)
 	mux.HandleFunc("/api/forge", ba.handleForgeStatus)
+	mux.HandleFunc("/api/forge/environments", ba.handleForgeEnvironments)
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
@@ -644,6 +650,18 @@ func (ba *BusAgent) handleForgeStatus(w http.ResponseWriter, r *http.Request) {
 		status = []ProjectStatus{}
 	}
 	json.NewEncoder(w).Encode(status)
+}
+
+func (ba *BusAgent) handleForgeEnvironments(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	// Return environment-centric view instead of project-slots
+	environments := ba.envManager.Status()
+	if environments == nil {
+		environments = []EnvironmentInfo{}
+	}
+	json.NewEncoder(w).Encode(environments)
 }
 
 func (ba *BusAgent) handleForgeDeploy(w http.ResponseWriter, r *http.Request) {
