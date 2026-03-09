@@ -213,6 +213,20 @@ func (b *CLIBackend) Run(ctx context.Context, agent string, msg siMessage, injec
 					StreamID:     streamID,
 					Timestamp:    time.Now(),
 				})
+			} else if strings.HasPrefix(line, "INBER_THINK:") && onStream != nil {
+				thinking := strings.TrimPrefix(line, "INBER_THINK:")
+				thinking = strings.ReplaceAll(thinking, "\\n", "\n")
+				thinking = strings.ReplaceAll(thinking, "\\r", "\r")
+				onStream(siMessage{
+					Text:         thinking,
+					Channel:      msg.Channel,
+					Agent:        agent,
+					Author:       agent,
+					Orchestrator: b.name,
+					Stream:       "thinking",
+					StreamID:     streamID,
+					Timestamp:    time.Now(),
+				})
 			} else if strings.HasPrefix(line, "INBER_TOOL:") && onStream != nil {
 				// Stream tool events in real-time
 				jsonStr := strings.TrimPrefix(line, "INBER_TOOL:")
