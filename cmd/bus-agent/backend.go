@@ -240,6 +240,9 @@ func (b *CLIBackend) Run(ctx context.Context, agent string, msg siMessage, injec
 	var parsedMeta *messageMeta
 	if b.meta {
 		parsedMeta = parseInberMeta(stderrStr, duration, agent)
+		if parsedMeta != nil {
+			parsedMeta.Tools = parseInberTools(stderrStr)
+		}
 	}
 
 	var parsedSpawns []spawnRequest
@@ -750,6 +753,51 @@ func parseInberMeta(stderr string, duration time.Duration, model string) *messag
 		return meta
 	}
 	return nil
+}
+
+// parseInberTools extracts INBER_TOOL:{...} events from stderr and pairs calls with results.
+func parseInberTools(stderr string) []toolEvent {
+	var pending *toolEvent
+	var tools []toolEvent
+
+	for _, line := range strings.Split(stderr, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "INBER_TOOL:") {
+			continue
+		}
+		jsonStr := strings.TrimPrefix(line, "INBER_TOOL:")
+		var raw struct {
+			Event  string `json:"event"`
+			Tool   string `json:"tool"`
+			Input  string `json:"input"`
+			Output string `json:"output"`
+			Error  bool   `json:"error"`
+		}
+		if json.Unmarshal([]byte(jsonStr), &raw) != nil {
+			continue
+		}
+
+		if raw.Event == "call" {
+			// If there's a pending call without result, flush it
+			if pending != nil {
+				tools = append(tools, *pending)
+			}
+			pending = &toolEvent{Tool: raw.Tool, Input: raw.Input}
+		} else if raw.Event == "result" {
+			if pending != nil && pending.Tool == raw.Tool {
+				pending.Output = raw.Output
+				pending.Error = raw.Error
+				tools = append(tools, *pending)
+				pending = nil
+			} else {
+				tools = append(tools, toolEvent{Tool: raw.Tool, Output: raw.Output, Error: raw.Error})
+			}
+		}
+	}
+	if pending != nil {
+		tools = append(tools, *pending)
+	}
+	return tools
 }
 
 // --- shared helpers ---
