@@ -213,6 +213,35 @@ func (b *CLIBackend) Run(ctx context.Context, agent string, msg siMessage, injec
 					StreamID:     streamID,
 					Timestamp:    time.Now(),
 				})
+			} else if strings.HasPrefix(line, "INBER_TOOL:") && onStream != nil {
+				// Stream tool events in real-time
+				jsonStr := strings.TrimPrefix(line, "INBER_TOOL:")
+				var raw struct {
+					Event  string `json:"event"`
+					Tool   string `json:"tool"`
+					Input  string `json:"input"`
+					Output string `json:"output"`
+					Error  bool   `json:"error"`
+				}
+				if json.Unmarshal([]byte(jsonStr), &raw) == nil {
+					toolMsg := siMessage{
+						Channel:      msg.Channel,
+						Agent:        agent,
+						Author:       agent,
+						Orchestrator: b.name,
+						StreamID:     streamID,
+						Timestamp:    time.Now(),
+					}
+					if raw.Event == "call" {
+						toolMsg.Stream = "tool_call"
+						toolMsg.Meta = &messageMeta{Tools: []toolEvent{{Tool: raw.Tool, Input: raw.Input}}}
+					} else if raw.Event == "result" {
+						toolMsg.Stream = "tool_result"
+						toolMsg.Meta = &messageMeta{Tools: []toolEvent{{Tool: raw.Tool, Output: raw.Output, Error: raw.Error}}}
+					}
+					onStream(toolMsg)
+				}
+				stderrLines = append(stderrLines, line)
 			} else {
 				stderrLines = append(stderrLines, line)
 			}
