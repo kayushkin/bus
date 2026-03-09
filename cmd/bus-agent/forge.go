@@ -121,6 +121,8 @@ type SlotInfo struct {
 	Dirty        bool   `json:"dirty"`
 	DirtyFiles   int    `json:"dirty_files,omitempty"`
 	UncommittedChanges string `json:"uncommitted_changes,omitempty"`
+	Ahead        int    `json:"ahead"`
+	Behind       int    `json:"behind"`
 	Path         string `json:"path"`
 }
 
@@ -170,6 +172,7 @@ func (fm *ForgeManager) Status() []ProjectStatus {
 			if dirty {
 				si.UncommittedChanges = gitPorcelain(s.Path)
 			}
+			si.Ahead, si.Behind = gitAheadBehind(s.Path)
 
 			ps.Slots = append(ps.Slots, si)
 		}
@@ -375,6 +378,19 @@ func lastLines(s string, n int) string {
 		return strings.TrimSpace(s)
 	}
 	return strings.Join(lines[len(lines)-n:], "\n")
+}
+
+// gitAheadBehind returns how many commits ahead/behind origin/main a worktree is.
+func gitAheadBehind(path string) (ahead, behind int) {
+	// Fetch to make sure we have latest refs
+	exec.Command("git", "-C", path, "fetch", "origin", "main", "--quiet").Run()
+	cmd := exec.Command("git", "-C", path, "rev-list", "--left-right", "--count", "HEAD...origin/main")
+	out, err := cmd.Output()
+	if err != nil {
+		return 0, 0
+	}
+	fmt.Sscanf(strings.TrimSpace(string(out)), "%d\t%d", &ahead, &behind)
+	return
 }
 
 // autoCommitDirty commits any uncommitted changes in a worktree.
