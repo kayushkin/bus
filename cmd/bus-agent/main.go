@@ -671,27 +671,35 @@ func (ba *BusAgent) handleForgeDeploy(w http.ResponseWriter, r *http.Request) {
 	var err error
 
 	if req.Target == "prod" {
-		// Find base repo for the project
+		// Resolve deploy directory: use slot path if specified, otherwise base repo
 		projects := ba.forge.Status()
-		var baseRepo string
+		var deployDir string
 		for _, p := range projects {
 			if p.ID == req.Project {
-				baseRepo = p.BaseRepo
+				if req.Slot >= 0 {
+					for _, s := range p.Slots {
+						if s.ID == req.Slot {
+							deployDir = s.Path
+						}
+					}
+				}
+				if deployDir == "" {
+					deployDir = p.BaseRepo
+				}
 			}
 		}
-		if baseRepo == "" {
+		if deployDir == "" {
 			http.Error(w, `{"error":"project not found"}`, http.StatusNotFound)
 			return
 		}
 		if req.Commit != "" {
-			// Checkout commit in base repo first
-			cmd := exec.Command("git", "-C", baseRepo, "checkout", req.Commit)
+			cmd := exec.Command("git", "-C", deployDir, "checkout", req.Commit)
 			if out, err := cmd.CombinedOutput(); err != nil {
 				http.Error(w, fmt.Sprintf(`{"error":"git checkout failed: %s"}`, string(out)), http.StatusInternalServerError)
 				return
 			}
 		}
-		deployID, err = ba.forge.DeployProd(req.Project, baseRepo, req.TriggeredBy)
+		deployID, err = ba.forge.DeployProd(req.Project, deployDir, req.TriggeredBy)
 	} else if req.Commit != "" {
 		deployID, err = ba.forge.DeployCommit(req.Project, req.Slot, req.Commit, req.TriggeredBy)
 	} else {

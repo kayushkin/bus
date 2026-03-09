@@ -288,7 +288,7 @@ func (fm *ForgeManager) DeployDev(project string, slotID int, triggeredBy string
 	return deployID, nil
 }
 
-// DeployProd deploys to production.
+// DeployProd deploys to production from a repo directory (base repo or slot).
 func (fm *ForgeManager) DeployProd(project, repoDir, triggeredBy string) (int64, error) {
 	if fm.forge == nil {
 		return 0, fmt.Errorf("forge not available")
