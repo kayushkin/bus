@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/kayushkin/forge"
 )
@@ -21,7 +22,7 @@ type ForgeManager struct {
 	held map[string]*forge.Slot // sessionID → slot
 }
 
-// NewForgeManager opens the forge database.
+// NewForgeManager opens the forge database and starts background fetch.
 func NewForgeManager() *ForgeManager {
 	f, err := forge.Open("")
 	if err != nil {
@@ -29,7 +30,35 @@ func NewForgeManager() *ForgeManager {
 		return &ForgeManager{held: make(map[string]*forge.Slot)}
 	}
 	log.Printf("[forge] opened %s", forge.DefaultPath())
-	return &ForgeManager{forge: f, held: make(map[string]*forge.Slot)}
+	fm := &ForgeManager{forge: f, held: make(map[string]*forge.Slot)}
+	go fm.backgroundFetch()
+	return fm
+}
+
+// backgroundFetch periodically fetches origin/main for all base repos.
+// Runs every 60s to keep ahead/behind counts fresh without blocking API calls.
+func (fm *ForgeManager) backgroundFetch() {
+	if fm.forge == nil {
+		return
+	}
+	// Initial delay to let startup finish
+	time.Sleep(5 * time.Second)
+	for {
+		projects, err := fm.forge.ListProjects()
+		if err == nil {
+			seen := map[string]bool{}
+			for _, p := range projects {
+				repo := expandHome(p.BaseRepo)
+				if seen[repo] {
+					continue
+				}
+				seen[repo] = true
+				cmd := exec.Command("git", "-C", repo, "fetch", "origin", "main", "--quiet")
+				cmd.Run()
+			}
+		}
+		time.Sleep(60 * time.Second)
+	}
 }
 
 // AcquireByProject tries to get a slot for an agent by forge project ID.
@@ -421,9 +450,8 @@ func gitCommitTime(path string) int64 {
 }
 
 // gitAheadBehind returns how many commits ahead/behind origin/main a worktree is.
+// Uses cached refs — no network calls. Background fetch keeps refs fresh.
 func gitAheadBehind(path string) (ahead, behind int) {
-	// Fetch to make sure we have latest refs
-	exec.Command("git", "-C", path, "fetch", "origin", "main", "--quiet").Run()
 	cmd := exec.Command("git", "-C", path, "rev-list", "--left-right", "--count", "HEAD...origin/main")
 	out, err := cmd.Output()
 	if err != nil {
