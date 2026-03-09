@@ -614,6 +614,7 @@ func (ba *BusAgent) serveAPI() {
 	mux.HandleFunc("/api/models", ba.handleModelsStatus)
 	mux.HandleFunc("/api/forge/deploy", ba.handleForgeDeploy)
 	mux.HandleFunc("/api/forge/deploys", ba.handleForgeDeploys)
+	mux.HandleFunc("/api/forge/release", ba.handleForgeRelease)
 	mux.HandleFunc("/api/forge", ba.handleForgeStatus)
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -718,6 +719,38 @@ func (ba *BusAgent) handleForgeDeploy(w http.ResponseWriter, r *http.Request) {
 		"deploy_id": deployID,
 		"status":    "running",
 	})
+}
+
+func (ba *BusAgent) handleForgeRelease(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	if r.Method == http.MethodOptions {
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Project string `json:"project"`
+		Slot    int    `json:"slot"`
+		Clean   bool   `json:"clean"` // reset to origin/main
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		return
+	}
+
+	if req.Clean {
+		ba.forge.CleanSlot(req.Project, req.Slot)
+	}
+	ba.forge.ForceRelease(req.Project, req.Slot)
+
+	json.NewEncoder(w).Encode(map[string]string{"status": "released"})
 }
 
 func (ba *BusAgent) handleForgeDeploys(w http.ResponseWriter, r *http.Request) {

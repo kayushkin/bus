@@ -57,6 +57,9 @@ func (fm *ForgeManager) backgroundFetch() {
 				cmd.Run()
 			}
 		}
+		// Also clean up stale slots
+		fm.AutoReleaseStale()
+
 		time.Sleep(60 * time.Second)
 	}
 }
@@ -250,6 +253,70 @@ func gitPorcelain(path string) string {
 		s = s[:500] + "…"
 	}
 	return s
+}
+
+// ForceRelease releases a slot directly (from dashboard, not via slotKey tracking).
+func (fm *ForgeManager) ForceRelease(project string, slotID int) {
+	if fm.forge == nil {
+		return
+	}
+	// Also remove from held map if tracked
+	fm.mu.Lock()
+	for key, slot := range fm.held {
+		if slot.Project == project && slot.ID == slotID {
+			delete(fm.held, key)
+			break
+		}
+	}
+	fm.mu.Unlock()
+
+	if err := fm.forge.Release(project, slotID); err != nil {
+		log.Printf("[forge] force-release slot %d failed: %v", slotID, err)
+		return
+	}
+	log.Printf("[forge] force-released slot %d for %s", slotID, project)
+	fm.notifyRelease()
+}
+
+// CleanSlot resets a slot to origin/main.
+func (fm *ForgeManager) CleanSlot(project string, slotID int) {
+	if fm.forge == nil {
+		return
+	}
+	if err := fm.forge.CleanSlot(project, slotID); err != nil {
+		log.Printf("[forge] clean slot %d failed: %v", slotID, err)
+	}
+}
+
+// AutoReleaseStale checks for slots that should be auto-released:
+// - Slot is "ready" (not acquired) but has commits that are now in main (merged/pushed)
+// - Slot has been sitting idle with no changes for too long
+func (fm *ForgeManager) AutoReleaseStale() {
+	if fm.forge == nil {
+		return
+	}
+	projects, err := fm.forge.ListProjects()
+	if err != nil {
+		return
+	}
+	for _, p := range projects {
+		slots, err := fm.forge.SlotStatus(p.ID)
+		if err != nil {
+			continue
+		}
+		for _, s := range slots {
+			if s.Status != "ready" {
+				continue
+			}
+			ahead, behind := gitAheadBehind(s.Path)
+			dirty, _ := gitDirtyStatus(s.Path)
+			// If slot is behind main and not ahead and not dirty, it's stale — clean it
+			if behind > 0 && ahead == 0 && !dirty {
+				log.Printf("[forge] auto-cleaning stale slot %d for %s (behind=%d)", s.ID, p.ID, behind)
+				fm.forge.CleanSlot(p.ID, s.ID)
+			}
+		}
+	}
 }
 
 // AutoDeployIfDirty checks if a slot has uncommitted or new changes and auto-deploys to dev.
