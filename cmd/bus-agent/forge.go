@@ -319,6 +319,38 @@ func (fm *ForgeManager) AutoReleaseStale() {
 	}
 }
 
+// CommitAndDeploy commits any dirty files and deploys to dev preview.
+// Called after a successful agent turn with a summary for the commit message.
+func (fm *ForgeManager) CommitAndDeploy(slotKey, summary string) {
+	if fm.forge == nil || slotKey == "" {
+		return
+	}
+
+	fm.mu.Lock()
+	slot, ok := fm.held[slotKey]
+	fm.mu.Unlock()
+	if !ok {
+		return
+	}
+
+	// Check for dirty files
+	dirty, _ := gitDirtyStatus(slot.Path)
+	if !dirty {
+		log.Printf("[forge] slot %d: no dirty files, skipping commit", slot.ID)
+		return
+	}
+
+	// Commit dirty files with agent's summary
+	log.Printf("[forge] slot %d: committing with summary: %s", slot.ID, truncate(summary, 60))
+	autoCommitDirty(slot.Path, summary)
+
+	// Deploy to dev preview
+	log.Printf("[forge] deploying slot %d to dev", slot.ID)
+	if _, err := fm.DeployDev(slot.Project, slot.ID, "turn-end"); err != nil {
+		log.Printf("[forge] deploy failed: %v", err)
+	}
+}
+
 // AutoDeployIfDirty checks if a slot has uncommitted or new changes and auto-deploys to dev.
 func (fm *ForgeManager) AutoDeployIfDirty(slotKey, agentName string) {
 	if fm.forge == nil || slotKey == "" {
@@ -530,7 +562,7 @@ func gitAheadBehind(path string) (ahead, behind int) {
 
 // autoCommitDirty commits any uncommitted changes in a worktree.
 // Skips .inber/ session artifacts.
-func autoCommitDirty(path, triggeredBy string) {
+func autoCommitDirty(path, commitMsg string) {
 	// Check if dirty
 	cmd := exec.Command("git", "-C", path, "status", "--porcelain")
 	out, err := cmd.Output()
@@ -550,8 +582,7 @@ func autoCommitDirty(path, triggeredBy string) {
 		return // nothing staged
 	}
 
-	msg := fmt.Sprintf("deploy: auto-commit by %s", triggeredBy)
-	cmd = exec.Command("git", "-C", path, "commit", "-m", msg)
+	cmd = exec.Command("git", "-C", path, "commit", "-m", commitMsg)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		log.Printf("[forge] auto-commit failed: %v\n%s", err, out)
 	} else {

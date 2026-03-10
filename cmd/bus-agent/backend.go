@@ -27,7 +27,7 @@ type RunOpts struct {
 
 // Backend executes agent tasks.
 type Backend interface {
-	Run(ctx context.Context, agent string, msg siMessage, inject <-chan siMessage, onStream StreamFunc, opts RunOpts) (siMessage, []spawnRequest)
+	Run(ctx context.Context, agent string, msg siMessage, inject <-chan siMessage, onStream StreamFunc, opts RunOpts) (siMessage, []spawnRequest, string)
 }
 
 // BackendConfig defines a backend in the config file.
@@ -125,7 +125,7 @@ type CLIBackend struct {
 	timeout time.Duration
 }
 
-func (b *CLIBackend) Run(ctx context.Context, agent string, msg siMessage, injectCh <-chan siMessage, onStream StreamFunc, opts RunOpts) (siMessage, []spawnRequest) {
+func (b *CLIBackend) Run(ctx context.Context, agent string, msg siMessage, injectCh <-chan siMessage, onStream StreamFunc, opts RunOpts) (siMessage, []spawnRequest, string) {
 	// Build command with {agent} placeholder replacement.
 	args := make([]string, len(b.cmd))
 	for i, a := range b.cmd {
@@ -149,16 +149,16 @@ func (b *CLIBackend) Run(ctx context.Context, agent string, msg siMessage, injec
 
 	stdinPipe, err := cmd.StdinPipe()
 	if err != nil {
-		return errResp(msg, err), nil
+		return errResp(msg, err), nil, ""
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return errResp(msg, err), nil
+		return errResp(msg, err), nil, ""
 	}
 	stderrPipe, _ := cmd.StderrPipe()
 
 	if err := cmd.Start(); err != nil {
-		return errResp(msg, fmt.Errorf("start %s: %w", args[0], err)), nil
+		return errResp(msg, fmt.Errorf("start %s: %w", args[0], err)), nil, ""
 	}
 
 	// Write initial message.
@@ -295,6 +295,9 @@ func (b *CLIBackend) Run(ctx context.Context, agent string, msg siMessage, injec
 		parsedSpawns = parseInberSpawns(stderrStr)
 	}
 
+	// Parse turn end summary for commit message
+	turnEndSummary := parseInberTurnEnd(stderrStr)
+
 	log.Printf("[%s] → [%s] %s: %s (%.1fs)",
 		b.name, msg.Channel, agent, truncate(text, 80), duration.Seconds())
 
@@ -314,7 +317,7 @@ func (b *CLIBackend) Run(ctx context.Context, agent string, msg siMessage, injec
 		StreamID:     streamID,
 		Timestamp:    time.Now(),
 		Meta:         parsedMeta,
-	}, parsedSpawns
+	}, parsedSpawns, turnEndSummary
 }
 
 // --- HTTP Backend ---
@@ -329,7 +332,7 @@ type HTTPBackend struct {
 	client  *http.Client
 }
 
-func (b *HTTPBackend) Run(ctx context.Context, agent string, msg siMessage, _ <-chan siMessage, _ StreamFunc, _ RunOpts) (siMessage, []spawnRequest) {
+func (b *HTTPBackend) Run(ctx context.Context, agent string, msg siMessage, _ <-chan siMessage, _ StreamFunc, _ RunOpts) (siMessage, []spawnRequest, string) {
 	reqBody := struct {
 		Text    string `json:"text"`
 		Agent   string `json:"agent"`
@@ -346,7 +349,7 @@ func (b *HTTPBackend) Run(ctx context.Context, agent string, msg siMessage, _ <-
 	url := strings.TrimRight(b.url, "/") + "/api/run"
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(data))
 	if err != nil {
-		return errResp(msg, err), nil
+		return errResp(msg, err), nil, ""
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if b.token != "" {
@@ -356,7 +359,7 @@ func (b *HTTPBackend) Run(ctx context.Context, agent string, msg siMessage, _ <-
 	start := time.Now()
 	resp, err := b.client.Do(req)
 	if err != nil {
-		return errResp(msg, err), nil
+		return errResp(msg, err), nil, ""
 	}
 	defer resp.Body.Close()
 
@@ -365,7 +368,7 @@ func (b *HTTPBackend) Run(ctx context.Context, agent string, msg siMessage, _ <-
 
 	if resp.StatusCode != http.StatusOK {
 		return errResp(msg, fmt.Errorf("http %d: %s", resp.StatusCode,
-			truncate(string(body), 200))), nil
+			truncate(string(body), 200))), nil, ""
 	}
 
 	var result struct {
@@ -388,7 +391,7 @@ func (b *HTTPBackend) Run(ctx context.Context, agent string, msg siMessage, _ <-
 		Orchestrator: b.name,
 		Timestamp:    time.Now(),
 		Meta:         result.Meta,
-	}, nil
+	}, nil, ""
 }
 
 // --- OpenAI Backend ---
@@ -454,7 +457,7 @@ func (b *OpenAIBackend) getHistory(key string) []openaiChatMessage {
 	return out
 }
 
-func (b *OpenAIBackend) Run(ctx context.Context, agent string, msg siMessage, _ <-chan siMessage, onStream StreamFunc, _ RunOpts) (siMessage, []spawnRequest) {
+func (b *OpenAIBackend) Run(ctx context.Context, agent string, msg siMessage, _ <-chan siMessage, onStream StreamFunc, _ RunOpts) (siMessage, []spawnRequest, string) {
 	backendAgent := b.resolveAgentID(agent)
 
 	content := msg.Text
@@ -496,7 +499,7 @@ func (b *OpenAIBackend) Run(ctx context.Context, agent string, msg siMessage, _ 
 	url := strings.TrimRight(b.url, "/") + "/v1/chat/completions"
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(data))
 	if err != nil {
-		return errResp(msg, err), nil
+		return errResp(msg, err), nil, ""
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if b.token != "" {
@@ -513,14 +516,14 @@ func (b *OpenAIBackend) Run(ctx context.Context, agent string, msg siMessage, _ 
 	start := time.Now()
 	resp, err := b.client.Do(req)
 	if err != nil {
-		return errResp(msg, err), nil
+		return errResp(msg, err), nil, ""
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		return errResp(msg, fmt.Errorf("http %d: %s", resp.StatusCode,
-			truncate(string(body), 200))), nil
+			truncate(string(body), 200))), nil, ""
 	}
 
 	var fullText string
@@ -600,7 +603,7 @@ func (b *OpenAIBackend) Run(ctx context.Context, agent string, msg siMessage, _ 
 		body, _ := io.ReadAll(resp.Body)
 		var result openaiChatCompletion
 		if err := json.Unmarshal(body, &result); err != nil {
-			return errResp(msg, fmt.Errorf("parse response: %w", err)), nil
+			return errResp(msg, fmt.Errorf("parse response: %w", err)), nil, ""
 		}
 		if len(result.Choices) > 0 {
 			fullText = result.Choices[0].Message.Content
@@ -667,7 +670,7 @@ func (b *OpenAIBackend) Run(ctx context.Context, agent string, msg siMessage, _ 
 		StreamID:     finalStreamID,
 		Timestamp:    time.Now(),
 		Meta:         meta,
-	}, nil
+	}, nil, ""
 }
 
 // OpenAI API types.
@@ -906,4 +909,24 @@ func expandHome(path string) string {
 		}
 	}
 	return path
+}
+
+// parseInberTurnEnd extracts INBER_TURN_END:{...} from stderr.
+// Returns the commit summary if found, empty string otherwise.
+func parseInberTurnEnd(stderr string) string {
+	for _, line := range strings.Split(stderr, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "INBER_TURN_END:") {
+			jsonStr := strings.TrimPrefix(line, "INBER_TURN_END:")
+			var turnEnd struct {
+				Summary string `json:"summary"`
+			}
+			if err := json.Unmarshal([]byte(jsonStr), &turnEnd); err != nil {
+				log.Printf("[cli] failed to parse INBER_TURN_END: %v", err)
+				continue
+			}
+			return turnEnd.Summary
+		}
+	}
+	return ""
 }

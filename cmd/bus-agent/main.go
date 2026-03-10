@@ -380,7 +380,7 @@ func (ba *BusAgent) runQueue(q *agentQueue) {
 				ba.publish(delta)
 			}
 
-			resp, spawns := backend.Run(ba.ctx, task.target.Name, task.msg, inject, onStream, runOpts)
+			resp, spawns, turnEndSummary := backend.Run(ba.ctx, task.target.Name, task.msg, inject, onStream, runOpts)
 
 			// Clear injection state and re-queue any unread injected messages.
 			q.mu.Lock()
@@ -396,9 +396,9 @@ func (ba *BusAgent) runQueue(q *agentQueue) {
 				q.ch <- agentTask{msg: leftover, target: task.target}
 			}
 
-			// Auto-deploy to dev preview if the agent made changes, then release slot.
-			if slotKey != "" {
-				ba.forge.AutoDeployIfDirty(slotKey, task.target.Name)
+			// Commit and deploy if agent finished with changes.
+			if slotKey != "" && turnEndSummary != "" {
+				ba.forge.CommitAndDeploy(slotKey, turnEndSummary)
 			}
 			ba.forge.Release(slotKey)
 
