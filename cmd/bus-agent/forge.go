@@ -65,9 +65,9 @@ func (fm *ForgeManager) backgroundFetch() {
 }
 
 // AcquireByProject tries to get a slot for an agent by forge project ID.
-func (fm *ForgeManager) AcquireByProject(agentName, sessionID, projectID string) (slotPath string, slotKey string) {
+func (fm *ForgeManager) AcquireByProject(agentName, sessionID, projectID string) (slotPath string, slotKey string, slotID int) {
 	if fm.forge == nil {
-		return "", ""
+		return "", "", 0
 	}
 
 	fm.mu.Lock()
@@ -80,7 +80,7 @@ func (fm *ForgeManager) AcquireByProject(agentName, sessionID, projectID string)
 	})
 	if err != nil {
 		log.Printf("[forge] no slots for %q (project %s): %v", agentName, projectID, err)
-		return "", ""
+		return "", "", 0
 	}
 
 	// Clean slot (reset to origin/main) then pull latest
@@ -90,7 +90,7 @@ func (fm *ForgeManager) AcquireByProject(agentName, sessionID, projectID string)
 	key := projectID + ":" + sessionID
 	fm.held[key] = slot
 	log.Printf("[forge] %s acquired slot %d → %s", agentName, slot.ID, slot.Path)
-	return slot.Path, key
+	return slot.Path, key, slot.ID
 }
 
 // Release returns a slot to the pool and notifies any waiters.

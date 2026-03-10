@@ -347,18 +347,20 @@ func (ba *BusAgent) runQueue(q *agentQueue) {
 			if agentEntry, ok := ba.registry.FindAgent(task.target.Name); ok && agentEntry.Project != "" {
 				// Look up project's base repo from forge
 				sessionID := fmt.Sprintf("%s-%d", task.target.Name, time.Now().UnixMilli())
-				slotPath, key := ba.forge.AcquireByProject(task.target.Name, sessionID, agentEntry.Project)
+				slotPath, key, slotID := ba.forge.AcquireByProject(task.target.Name, sessionID, agentEntry.Project)
 				if slotPath != "" {
 					runOpts.WorkDir = slotPath
+					runOpts.EnvVars = []string{fmt.Sprintf("INBER_ENV=%d", slotID)}
 					slotKey = key
 				} else {
 					// No slot available — wait for one to free up
 					log.Printf("[bus-agent] %s/%s: waiting for forge slot (project=%s)...",
 						task.target.Name, task.target.Orchestrator, agentEntry.Project)
 					if ba.forge.WaitForSlot(ba.ctx) {
-						slotPath, key = ba.forge.AcquireByProject(task.target.Name, sessionID, agentEntry.Project)
+						slotPath, key, slotID = ba.forge.AcquireByProject(task.target.Name, sessionID, agentEntry.Project)
 						if slotPath != "" {
 							runOpts.WorkDir = slotPath
+							runOpts.EnvVars = []string{fmt.Sprintf("INBER_ENV=%d", slotID)}
 							slotKey = key
 						}
 					}

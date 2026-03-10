@@ -21,7 +21,8 @@ type StreamFunc func(delta siMessage)
 
 // RunOpts configures a backend run.
 type RunOpts struct {
-	WorkDir string // override working directory (e.g., forge slot path)
+	WorkDir string   // override working directory (e.g., forge slot path)
+	EnvVars []string // extra environment variables (e.g., INBER_ENV=0)
 }
 
 // Backend executes agent tasks.
@@ -144,6 +145,7 @@ func (b *CLIBackend) Run(ctx context.Context, agent string, msg siMessage, injec
 	}
 	cmd.Env = append(os.Environ(), b.env...)
 	cmd.Env = append(cmd.Env, "INBER_AGENT="+agent)
+	cmd.Env = append(cmd.Env, opts.EnvVars...)
 
 	stdinPipe, err := cmd.StdinPipe()
 	if err != nil {
