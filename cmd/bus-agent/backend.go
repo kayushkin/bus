@@ -59,6 +59,14 @@ func NewBackend(name string, cfg BackendConfig) (Backend, error) {
 	}
 
 	switch cfg.Type {
+	case "gateway":
+		return &GatewayBackend{
+			name:    name,
+			url:     cfg.URL,
+			timeout: timeout,
+			client:  &http.Client{Timeout: timeout},
+		}, nil
+
 	case "cli":
 		features := make(map[string]bool)
 		for _, f := range cfg.Features {
@@ -733,6 +741,236 @@ func readUsageFromFile(path, sessionKey string) (openaiUsage, bool) {
 		CompletionTokens: entry.OutputTokens,
 		TotalTokens:      entry.TotalTokens,
 	}, true
+}
+
+// --- Gateway Backend ---
+// Calls the inber gateway's /api/run endpoint with SSE streaming.
+// Spawns are handled in-process by the gateway — no INBER_SPAWN parsing needed.
+
+type GatewayBackend struct {
+	name    string
+	url     string // gateway base URL (e.g., http://localhost:8200)
+	timeout time.Duration
+	client  *http.Client
+}
+
+func (b *GatewayBackend) Run(ctx context.Context, agent string, msg siMessage, _ <-chan siMessage, onStream StreamFunc, _ RunOpts) (siMessage, []spawnRequest, string) {
+	reqBody := struct {
+		Agent      string `json:"agent"`
+		Message    string `json:"message"`
+		SessionKey string `json:"session_key"`
+		Channel    string `json:"channel"`
+		Author     string `json:"author,omitempty"`
+	}{
+		Agent:      agent,
+		Message:    msg.Text,
+		SessionKey: fmt.Sprintf("agent:%s:main", agent),
+		Channel:    msg.Channel,
+		Author:     msg.Author,
+	}
+	data, _ := json.Marshal(reqBody)
+
+	url := strings.TrimRight(b.url, "/") + "/api/run"
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(data))
+	if err != nil {
+		return errResp(msg, err), nil, ""
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	// Request SSE streaming if we have a stream callback.
+	if onStream != nil {
+		req.Header.Set("Accept", "text/event-stream")
+	}
+
+	start := time.Now()
+	resp, err := b.client.Do(req)
+	if err != nil {
+		return errResp(msg, fmt.Errorf("gateway unavailable: %w", err)), nil, ""
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return errResp(msg, fmt.Errorf("gateway %d: %s", resp.StatusCode,
+			truncate(string(body), 200))), nil, ""
+	}
+
+	streamID := fmt.Sprintf("s-%d", start.UnixMilli())
+
+	// SSE streaming response.
+	if resp.Header.Get("Content-Type") == "text/event-stream" && onStream != nil {
+		var fullText string
+		var meta *messageMeta
+		var tools []toolEvent       // accumulate tool events for final meta
+		var pendingTool *toolEvent   // pair call+result
+
+		scanner := bufio.NewScanner(resp.Body)
+		scanner.Buffer(make([]byte, 256*1024), 256*1024)
+		for scanner.Scan() {
+			line := scanner.Text()
+			if line == "" || !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			payload := strings.TrimPrefix(line, "data: ")
+
+			var event struct {
+				Kind string          `json:"kind"`
+				Text string          `json:"text"`
+				Tool string          `json:"tool,omitempty"`
+				Data json.RawMessage `json:"data,omitempty"`
+			}
+			if json.Unmarshal([]byte(payload), &event) != nil {
+				continue
+			}
+
+			switch event.Kind {
+			case "delta":
+				fullText += event.Text
+				onStream(siMessage{
+					Text:         event.Text,
+					Channel:      msg.Channel,
+					Agent:        agent,
+					Author:       agent,
+					Orchestrator: "inber",
+					Stream:       "delta",
+					StreamID:     streamID,
+					Timestamp:    time.Now(),
+				})
+
+			case "thinking":
+				onStream(siMessage{
+					Text:         event.Text,
+					Channel:      msg.Channel,
+					Agent:        agent,
+					Author:       agent,
+					Orchestrator: "inber",
+					Stream:       "thinking",
+					StreamID:     streamID,
+					Timestamp:    time.Now(),
+				})
+
+			case "tool_call":
+				// Flush any pending unpaired tool call.
+				if pendingTool != nil {
+					tools = append(tools, *pendingTool)
+				}
+				pendingTool = &toolEvent{Tool: event.Tool, Input: event.Text}
+				onStream(siMessage{
+					Channel:      msg.Channel,
+					Agent:        agent,
+					Author:       agent,
+					Orchestrator: "inber",
+					Stream:       "tool_call",
+					StreamID:     streamID,
+					Timestamp:    time.Now(),
+					Meta:         &messageMeta{Tools: []toolEvent{{Tool: event.Tool, Input: event.Text}}},
+				})
+
+			case "tool_result":
+				if pendingTool != nil && pendingTool.Tool == event.Tool {
+					pendingTool.Output = event.Text
+					tools = append(tools, *pendingTool)
+					pendingTool = nil
+				} else {
+					tools = append(tools, toolEvent{Tool: event.Tool, Output: event.Text})
+				}
+				onStream(siMessage{
+					Channel:      msg.Channel,
+					Agent:        agent,
+					Author:       agent,
+					Orchestrator: "inber",
+					Stream:       "tool_result",
+					StreamID:     streamID,
+					Timestamp:    time.Now(),
+					Meta:         &messageMeta{Tools: []toolEvent{{Tool: event.Tool, Output: event.Text}}},
+				})
+
+			case "done":
+				fullText = event.Text
+				if event.Data != nil {
+					var doneData struct {
+						Tokens     messageMeta `json:"tokens"`
+						DurationMs int64       `json:"duration_ms"`
+					}
+					if json.Unmarshal(event.Data, &doneData) == nil {
+						meta = &messageMeta{
+							InputTokens:         doneData.Tokens.InputTokens,
+							OutputTokens:        doneData.Tokens.OutputTokens,
+							CacheReadTokens:     doneData.Tokens.CacheReadTokens,
+							CacheCreationTokens: doneData.Tokens.CacheCreationTokens,
+							Cost:                doneData.Tokens.Cost,
+							DurationMs:          doneData.DurationMs,
+						}
+					}
+				}
+			}
+		}
+
+		// Flush any trailing unpaired tool call.
+		if pendingTool != nil {
+			tools = append(tools, *pendingTool)
+		}
+
+		duration := time.Since(start)
+		if meta == nil {
+			meta = &messageMeta{DurationMs: duration.Milliseconds()}
+		}
+		// Attach accumulated tool events so the dashboard persists them.
+		if len(tools) > 0 {
+			meta.Tools = tools
+			meta.ToolCalls = len(tools)
+		}
+
+		log.Printf("[gateway] → [%s] %s: %s (%.1fs)", msg.Channel, agent, truncate(fullText, 80), duration.Seconds())
+
+		return siMessage{
+			Text:         fullText,
+			Channel:      msg.Channel,
+			Agent:        agent,
+			Author:       agent,
+			Orchestrator: "inber",
+			Stream:       "done",
+			StreamID:     streamID,
+			Timestamp:    time.Now(),
+			Meta:         meta,
+		}, nil, ""
+	}
+
+	// Non-streaming JSON response.
+	body, _ := io.ReadAll(resp.Body)
+	var result struct {
+		Text       string `json:"text"`
+		SessionKey string `json:"session_key"`
+		Tokens     struct {
+			Input      int     `json:"input"`
+			Output     int     `json:"output"`
+			CacheRead  int     `json:"cache_read"`
+			CacheWrite int     `json:"cache_write"`
+			Cost       float64 `json:"cost"`
+		} `json:"tokens"`
+		DurationMs int64 `json:"duration_ms"`
+	}
+	json.Unmarshal(body, &result)
+
+	duration := time.Since(start)
+	log.Printf("[gateway] → [%s] %s: %s (%.1fs)", msg.Channel, agent, truncate(result.Text, 80), duration.Seconds())
+
+	return siMessage{
+		Text:         result.Text,
+		Channel:      msg.Channel,
+		Agent:        agent,
+		Author:       agent,
+		Orchestrator: "inber",
+		Timestamp:    time.Now(),
+		Meta: &messageMeta{
+			InputTokens:         result.Tokens.Input,
+			OutputTokens:        result.Tokens.Output,
+			CacheReadTokens:     result.Tokens.CacheRead,
+			CacheCreationTokens: result.Tokens.CacheWrite,
+			Cost:                result.Tokens.Cost,
+			DurationMs:          duration.Milliseconds(),
+		},
+	}, nil, "" // no spawns
 }
 
 // --- parse helpers (used by CLIBackend) ---

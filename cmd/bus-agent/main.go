@@ -223,7 +223,7 @@ func main() {
 		log.Printf("[bus-agent] backend %q (%s) ready", be.Name, be.Type)
 	}
 	if len(backends) == 0 {
-		log.Fatalf("[bus-agent] no backends configured in DB")
+		log.Printf("[bus-agent] warning: no backends configured in DB (API-only mode)")
 	}
 
 	// Load agents and routes from DB.
