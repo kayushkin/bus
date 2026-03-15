@@ -342,12 +342,12 @@ type HTTPBackend struct {
 
 func (b *HTTPBackend) Run(ctx context.Context, agent string, msg siMessage, _ <-chan siMessage, _ StreamFunc, _ RunOpts) (siMessage, []spawnRequest, string) {
 	reqBody := struct {
-		Text    string `json:"text"`
+		Message string `json:"message"`
 		Agent   string `json:"agent"`
 		Channel string `json:"channel"`
 		Author  string `json:"author,omitempty"`
 	}{
-		Text:    msg.Text,
+		Message: msg.Text,
 		Agent:   agent,
 		Channel: msg.Channel,
 		Author:  msg.Author,
