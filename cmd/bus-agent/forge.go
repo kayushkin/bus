@@ -1,10 +1,10 @@
 package main
 
 import (
-	"context"
+	"encoding/json"
 	"fmt"
 	"log"
-	"os"
+	"net/http"
 	"os/exec"
 	"strings"
 	"sync"
@@ -13,35 +13,29 @@ import (
 	"github.com/kayushkin/forge"
 )
 
-// ForgeManager handles slot acquisition and release for agent tasks.
-// Bus-agent owns the forge lifecycle — agents just work in whatever directory they're given.
+// ForgeManager handles environment acquisition and release for agent tasks.
 type ForgeManager struct {
 	forge *forge.Forge
 	mu    sync.Mutex
-	// Track which slots are held so we can release on cleanup
-	held map[string]*forge.Slot // sessionID → slot
+	held  map[string]int // sessionKey → envID
 }
 
-// NewForgeManager opens the forge database and starts background fetch.
 func NewForgeManager() *ForgeManager {
 	f, err := forge.Open("")
 	if err != nil {
-		log.Printf("[forge] failed to open: %v (slot management disabled)", err)
-		return &ForgeManager{held: make(map[string]*forge.Slot)}
+		log.Printf("[forge] failed to open: %v (disabled)", err)
+		return &ForgeManager{held: make(map[string]int)}
 	}
 	log.Printf("[forge] opened %s", forge.DefaultPath())
-	fm := &ForgeManager{forge: f, held: make(map[string]*forge.Slot)}
+	fm := &ForgeManager{forge: f, held: make(map[string]int)}
 	go fm.backgroundFetch()
 	return fm
 }
 
-// backgroundFetch periodically fetches origin/main for all base repos.
-// Runs every 60s to keep ahead/behind counts fresh without blocking API calls.
 func (fm *ForgeManager) backgroundFetch() {
 	if fm.forge == nil {
 		return
 	}
-	// Initial delay to let startup finish
 	time.Sleep(5 * time.Second)
 	for {
 		projects, err := fm.forge.ListProjects()
@@ -57,14 +51,11 @@ func (fm *ForgeManager) backgroundFetch() {
 				cmd.Run()
 			}
 		}
-		// Also clean up stale slots
-		fm.AutoReleaseStale()
-
 		time.Sleep(60 * time.Second)
 	}
 }
 
-// AcquireByProject tries to get a slot for an agent by forge project ID.
+// AcquireByProject acquires an environment for an agent.
 func (fm *ForgeManager) AcquireByProject(agentName, sessionID, projectID string) (slotPath string, slotKey string, slotID int) {
 	if fm.forge == nil {
 		return "", "", 0
@@ -73,65 +64,60 @@ func (fm *ForgeManager) AcquireByProject(agentName, sessionID, projectID string)
 	fm.mu.Lock()
 	defer fm.mu.Unlock()
 
-	slot, err := fm.forge.Acquire(projectID, forge.AcquireOpts{
+	env, err := fm.forge.AcquireEnvironment(forge.AcquireOpts{
 		AgentID:      agentName,
 		SessionID:    sessionID,
 		Orchestrator: "bus-agent",
 	})
 	if err != nil {
-		log.Printf("[forge] no slots for %q (project %s): %v", agentName, projectID, err)
+		log.Printf("[forge] no env for %q (project %s): %v", agentName, projectID, err)
 		return "", "", 0
 	}
 
-	// Clean slot (reset to origin/main) then pull latest
-	fm.forge.CleanSlot(projectID, slot.ID)
-	fm.forge.SlotPull(projectID, slot.ID)
+	repos, _ := fm.forge.GetEnvironmentRepos(env.ID)
+	var path string
+	for _, r := range repos {
+		if r.ProjectID == projectID {
+			path = r.WorktreePath
+			break
+		}
+	}
+	if path == "" && len(repos) > 0 {
+		path = repos[0].WorktreePath
+	}
+	if path == "" {
+		log.Printf("[forge] env %d has no repo for project %s", env.ID, projectID)
+		fm.forge.ReleaseEnvironment(env.ID)
+		return "", "", 0
+	}
 
-	key := projectID + ":" + sessionID
-	fm.held[key] = slot
-	log.Printf("[forge] %s acquired slot %d → %s", agentName, slot.ID, slot.Path)
-	return slot.Path, key, slot.ID
+	key := fmt.Sprintf("%s:%s", projectID, sessionID)
+	fm.held[key] = env.ID
+	log.Printf("[forge] %s acquired env %d → %s", agentName, env.ID, path)
+	return path, key, env.ID
 }
 
-// Release returns a slot to the pool and notifies any waiters.
 func (fm *ForgeManager) Release(slotKey string) {
 	if fm.forge == nil || slotKey == "" {
 		return
 	}
-
 	fm.mu.Lock()
-	slot, ok := fm.held[slotKey]
+	envID, ok := fm.held[slotKey]
 	if ok {
 		delete(fm.held, slotKey)
 	}
 	fm.mu.Unlock()
-
 	if !ok {
 		return
 	}
-
-	if err := fm.forge.Release(slot.Project, slot.ID); err != nil {
-		log.Printf("[forge] failed to release slot %d: %v", slot.ID, err)
-		return
+	if err := fm.forge.ReleaseEnvironment(envID); err != nil {
+		log.Printf("[forge] release env %d failed: %v", envID, err)
 	}
-	log.Printf("[forge] released slot %d for %s", slot.ID, slot.Project)
-
-	// Notify waiters that a slot is available
-	fm.notifyRelease()
 }
 
-// slotRelease is used to notify blocked goroutines that a slot was freed.
 var slotRelease = make(chan struct{}, 10)
 
-func (fm *ForgeManager) notifyRelease() {
-	select {
-	case slotRelease <- struct{}{}:
-	default:
-	}
-}
-
-// WaitForSlot blocks until a slot release notification or context cancellation.
-func (fm *ForgeManager) WaitForSlot(ctx context.Context) bool {
+func (fm *ForgeManager) WaitForSlot(ctx interface{ Done() <-chan struct{} }) bool {
 	select {
 	case <-slotRelease:
 		return true
@@ -142,82 +128,159 @@ func (fm *ForgeManager) WaitForSlot(ctx context.Context) bool {
 
 // SlotInfo is the rich status of a single slot for the API.
 type SlotInfo struct {
-	ID           int    `json:"id"`
-	Project      string `json:"project"`
-	Status       string `json:"status"`
-	Agent        string `json:"agent,omitempty"`
-	SessionID    string `json:"session_id,omitempty"`
-	Branch       string `json:"branch,omitempty"`
-	Commit       string `json:"commit,omitempty"`
-	CommitMsg    string `json:"commit_message,omitempty"`
-	Dirty        bool   `json:"dirty"`
-	DirtyFiles   int    `json:"dirty_files,omitempty"`
+	ID                 int    `json:"id"`
+	Project            string `json:"project"`
+	Status             string `json:"status"`
+	Agent              string `json:"agent,omitempty"`
+	SessionID          string `json:"session_id,omitempty"`
+	Branch             string `json:"branch,omitempty"`
+	Commit             string `json:"commit,omitempty"`
+	CommitMsg          string `json:"commit_message,omitempty"`
+	Dirty              bool   `json:"dirty"`
+	DirtyFiles         int    `json:"dirty_files,omitempty"`
 	UncommittedChanges string `json:"uncommitted_changes,omitempty"`
-	Ahead        int    `json:"ahead"`
-	Behind       int    `json:"behind"`
-	CommitTime   int64  `json:"commit_time,omitempty"`
-	Path         string `json:"path"`
+	Ahead              int    `json:"ahead"`
+	Behind             int    `json:"behind"`
+	CommitTime         int64  `json:"commit_time,omitempty"`
+	Path               string `json:"path"`
 }
 
-// ProjectStatus is the full forge status for the API.
 type ProjectStatus struct {
 	ID       string     `json:"id"`
 	BaseRepo string     `json:"base_repo"`
 	Slots    []SlotInfo `json:"slots"`
 }
 
-// Status returns rich status for all projects and slots.
 func (fm *ForgeManager) Status() []ProjectStatus {
 	if fm.forge == nil {
 		return nil
 	}
-
 	projects, err := fm.forge.ListProjects()
 	if err != nil {
 		return nil
 	}
+	envs, _ := fm.forge.AllEnvironments()
 
 	var result []ProjectStatus
 	for _, p := range projects {
 		ps := ProjectStatus{ID: p.ID, BaseRepo: p.BaseRepo}
-
-		slots, err := fm.forge.SlotStatus(p.ID)
-		if err != nil {
-			continue
-		}
-
-		for _, s := range slots {
-			si := SlotInfo{
-				ID:      s.ID,
-				Project: s.Project,
-				Status:  s.Status,
-				Agent:   s.AgentID,
-				SessionID: s.SessionID,
-				Branch:  s.Branch,
-				Path:    s.Path,
+		for _, env := range envs {
+			repos, _ := fm.forge.GetEnvironmentRepos(env.ID)
+			for _, r := range repos {
+				if r.ProjectID == p.ID {
+					si := SlotInfo{
+						ID:        env.ID,
+						Project:   p.ID,
+						Status:    env.Status,
+						Agent:     env.AgentID,
+						SessionID: env.SessionID,
+						Path:      r.WorktreePath,
+					}
+					si.Commit, si.CommitMsg = gitHeadInfo(r.WorktreePath)
+					dirty, dirtyFiles := gitDirtyStatus(r.WorktreePath)
+					si.Dirty = dirty
+					si.DirtyFiles = dirtyFiles
+					si.Ahead, si.Behind = gitAheadBehind(r.WorktreePath)
+					si.CommitTime = gitCommitTime(r.WorktreePath)
+					ps.Slots = append(ps.Slots, si)
+				}
 			}
-
-			// Git info from the worktree
-			si.Commit, si.CommitMsg = gitHeadInfo(s.Path)
-			dirty, dirtyFiles := gitDirtyStatus(s.Path)
-			si.Dirty = dirty
-			si.DirtyFiles = dirtyFiles
-			if dirty {
-				si.UncommittedChanges = gitPorcelain(s.Path)
-			}
-			si.Ahead, si.Behind = gitAheadBehind(s.Path)
-			si.CommitTime = gitCommitTime(s.Path)
-
-			ps.Slots = append(ps.Slots, si)
 		}
-
 		result = append(result, ps)
 	}
 	return result
 }
 
-// gitHeadInfo returns the HEAD commit hash and message for a repo path.
+func (fm *ForgeManager) ForceRelease(project string, slotID int) {
+	if fm.forge == nil {
+		return
+	}
+	fm.mu.Lock()
+	for key, id := range fm.held {
+		if id == slotID {
+			delete(fm.held, key)
+			break
+		}
+	}
+	fm.mu.Unlock()
+	fm.forge.ReleaseEnvironment(slotID)
+}
+
+func (fm *ForgeManager) CleanSlot(project string, slotID int) {
+	if fm.forge == nil {
+		return
+	}
+	fm.forge.CleanEnvironment(slotID)
+}
+
+func (fm *ForgeManager) CommitAndDeploy(slotKey, summary string) {
+	if fm.forge == nil || slotKey == "" {
+		return
+	}
+	fm.mu.Lock()
+	envID, ok := fm.held[slotKey]
+	fm.mu.Unlock()
+	if !ok {
+		return
+	}
+	repos, _ := fm.forge.GetEnvironmentRepos(envID)
+	for _, r := range repos {
+		dirty, _ := gitDirtyStatus(r.WorktreePath)
+		if dirty {
+			autoCommitDirty(r.WorktreePath, summary)
+		}
+	}
+}
+
+func (fm *ForgeManager) DeployDev(project string, slotID int, triggeredBy string) (int64, error) {
+	if fm.forge == nil {
+		return 0, fmt.Errorf("forge not available")
+	}
+	hash, msg := gitHeadInfo("")
+	return fm.forge.RecordDeploy(project, fmt.Sprintf("dev-%d", slotID), hash, msg, "", triggeredBy)
+}
+
+func (fm *ForgeManager) DeployProd(project, repoDir, triggeredBy string) (int64, error) {
+	if fm.forge == nil {
+		return 0, fmt.Errorf("forge not available")
+	}
+	hash, msg := gitHeadInfo(repoDir)
+	branch := gitCurrentBranch(repoDir)
+	return fm.forge.RecordDeploy(project, "prod", hash, msg, branch, triggeredBy)
+}
+
+func (fm *ForgeManager) DeployCommit(project string, slotID int, commitHash, triggeredBy string) (int64, error) {
+	return fm.DeployDev(project, slotID, triggeredBy)
+}
+
+func (fm *ForgeManager) Deploys(project, target string, limit int) ([]forge.Deploy, error) {
+	if fm.forge == nil {
+		return nil, fmt.Errorf("forge not available")
+	}
+	if project == "" {
+		return fm.forge.AllDeploys(limit)
+	}
+	return fm.forge.ListDeploys(project, target, limit)
+}
+
+func (fm *ForgeManager) Close() {
+	fm.mu.Lock()
+	for key, envID := range fm.held {
+		fm.forge.ReleaseEnvironment(envID)
+		delete(fm.held, key)
+	}
+	fm.mu.Unlock()
+	if fm.forge != nil {
+		fm.forge.Close()
+	}
+}
+
+// --- git helpers ---
+
 func gitHeadInfo(path string) (hash, msg string) {
+	if path == "" {
+		return "", ""
+	}
 	cmd := exec.Command("git", "-C", path, "log", "-1", "--format=%h %s")
 	out, err := cmd.Output()
 	if err != nil {
@@ -230,8 +293,10 @@ func gitHeadInfo(path string) (hash, msg string) {
 	return line, ""
 }
 
-// gitDirtyStatus checks if a worktree has uncommitted changes.
 func gitDirtyStatus(path string) (dirty bool, fileCount int) {
+	if path == "" {
+		return false, 0
+	}
 	cmd := exec.Command("git", "-C", path, "status", "--porcelain", "-uno")
 	out, err := cmd.Output()
 	if err != nil {
@@ -244,7 +309,6 @@ func gitDirtyStatus(path string) (dirty bool, fileCount int) {
 	return true, strings.Count(lines, "\n") + 1
 }
 
-// gitPorcelain returns the raw git status --porcelain output.
 func gitPorcelain(path string) string {
 	cmd := exec.Command("git", "-C", path, "status", "--porcelain")
 	out, _ := cmd.Output()
@@ -255,289 +319,23 @@ func gitPorcelain(path string) string {
 	return s
 }
 
-// ForceRelease releases a slot directly (from dashboard, not via slotKey tracking).
-func (fm *ForgeManager) ForceRelease(project string, slotID int) {
-	if fm.forge == nil {
-		return
+func gitAheadBehind(path string) (ahead, behind int) {
+	if path == "" {
+		return 0, 0
 	}
-	// Also remove from held map if tracked
-	fm.mu.Lock()
-	for key, slot := range fm.held {
-		if slot.Project == project && slot.ID == slotID {
-			delete(fm.held, key)
-			break
-		}
-	}
-	fm.mu.Unlock()
-
-	if err := fm.forge.Release(project, slotID); err != nil {
-		log.Printf("[forge] force-release slot %d failed: %v", slotID, err)
-		return
-	}
-	log.Printf("[forge] force-released slot %d for %s", slotID, project)
-	fm.notifyRelease()
-}
-
-// CleanSlot resets a slot to origin/main.
-func (fm *ForgeManager) CleanSlot(project string, slotID int) {
-	if fm.forge == nil {
-		return
-	}
-	if err := fm.forge.CleanSlot(project, slotID); err != nil {
-		log.Printf("[forge] clean slot %d failed: %v", slotID, err)
-	}
-}
-
-// AutoReleaseStale checks for slots that should be auto-released:
-// - Slot is "ready" (not acquired) but has commits that are now in main (merged/pushed)
-// - Slot has been sitting idle with no changes for too long
-func (fm *ForgeManager) AutoReleaseStale() {
-	if fm.forge == nil {
-		return
-	}
-	projects, err := fm.forge.ListProjects()
-	if err != nil {
-		return
-	}
-	for _, p := range projects {
-		slots, err := fm.forge.SlotStatus(p.ID)
-		if err != nil {
-			continue
-		}
-		for _, s := range slots {
-			if s.Status != "ready" {
-				continue
-			}
-			ahead, behind := gitAheadBehind(s.Path)
-			dirty, _ := gitDirtyStatus(s.Path)
-			// If slot is behind main and not ahead and not dirty, it's stale — clean it
-			if behind > 0 && ahead == 0 && !dirty {
-				log.Printf("[forge] auto-cleaning stale slot %d for %s (behind=%d)", s.ID, p.ID, behind)
-				fm.forge.CleanSlot(p.ID, s.ID)
-			}
-		}
-	}
-}
-
-// CommitAndDeploy commits any dirty files and deploys to dev preview.
-// Called after a successful agent turn with a summary for the commit message.
-func (fm *ForgeManager) CommitAndDeploy(slotKey, summary string) {
-	if fm.forge == nil || slotKey == "" {
-		return
-	}
-
-	fm.mu.Lock()
-	slot, ok := fm.held[slotKey]
-	fm.mu.Unlock()
-	if !ok {
-		return
-	}
-
-	// Check for dirty files
-	dirty, _ := gitDirtyStatus(slot.Path)
-	if !dirty {
-		log.Printf("[forge] slot %d: no dirty files, skipping commit", slot.ID)
-		return
-	}
-
-	// Commit dirty files with agent's summary
-	log.Printf("[forge] slot %d: committing with summary: %s", slot.ID, truncate(summary, 60))
-	autoCommitDirty(slot.Path, summary)
-
-	// Deploy to dev preview
-	log.Printf("[forge] deploying slot %d to dev", slot.ID)
-	if _, err := fm.DeployDev(slot.Project, slot.ID, "turn-end"); err != nil {
-		log.Printf("[forge] deploy failed: %v", err)
-	}
-}
-
-// AutoDeployIfDirty checks if a slot has uncommitted or new changes and auto-deploys to dev.
-func (fm *ForgeManager) AutoDeployIfDirty(slotKey, agentName string) {
-	if fm.forge == nil || slotKey == "" {
-		return
-	}
-
-	fm.mu.Lock()
-	slot, ok := fm.held[slotKey]
-	fm.mu.Unlock()
-	if !ok {
-		return
-	}
-
-	// Check if slot has any changes (committed ahead of main, or dirty files)
-	dirty, _ := gitDirtyStatus(slot.Path)
-	ahead, _ := gitAheadBehind(slot.Path)
-	if !dirty && ahead == 0 {
-		return
-	}
-
-	log.Printf("[forge] auto-deploying slot %d for %s (dirty=%v, ahead=%d)", slot.ID, agentName, dirty, ahead)
-	if _, err := fm.DeployDev(slot.Project, slot.ID, agentName); err != nil {
-		log.Printf("[forge] auto-deploy failed: %v", err)
-	}
-}
-
-// Close releases all held slots and closes the database.
-func (fm *ForgeManager) Close() {
-	fm.mu.Lock()
-	slots := make(map[string]*forge.Slot, len(fm.held))
-	for k, v := range fm.held {
-		slots[k] = v
-	}
-	fm.held = make(map[string]*forge.Slot)
-	fm.mu.Unlock()
-
-	for _, slot := range slots {
-		fm.forge.Release(slot.Project, slot.ID)
-	}
-
-	if fm.forge != nil {
-		fm.forge.Close()
-	}
-}
-
-// DeployDev deploys a slot to its dev preview (build + serve).
-// Auto-commits any dirty files before deploying so the commit hash is accurate.
-func (fm *ForgeManager) DeployDev(project string, slotID int, triggeredBy string) (int64, error) {
-	if fm.forge == nil {
-		return 0, fmt.Errorf("forge not available")
-	}
-
-	slots, err := fm.forge.SlotStatus(project)
-	if err != nil {
-		return 0, err
-	}
-	var slot *forge.Slot
-	for _, s := range slots {
-		if s.ID == slotID {
-			slot = &s
-			break
-		}
-	}
-	if slot == nil {
-		return 0, fmt.Errorf("slot %d not found for project %s", slotID, project)
-	}
-
-	// Auto-commit dirty files so deploy commit hash is accurate
-	autoCommitDirty(slot.Path, triggeredBy)
-
-	hash, msg := gitHeadInfo(slot.Path)
-	branch := gitCurrentBranch(slot.Path)
-	target := fmt.Sprintf("dev-%d", slotID)
-
-	deployID, err := fm.forge.RecordDeploy(project, target, hash, msg, branch, triggeredBy)
-	if err != nil {
-		return 0, err
-	}
-
-	// Run deploy-dev.sh in background
-	go func() {
-		cmd := exec.Command(expandHome("~/bin/deploy-dev.sh"), fmt.Sprint(slotID), slot.Path)
-		cmd.Env = append(os.Environ(), fmt.Sprintf("SLOT_PATH=%s", slot.Path))
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			log.Printf("[forge] deploy dev-%d failed: %v\n%s", slotID, err, out)
-			fm.forge.FinishDeploy(deployID, false, fmt.Sprintf("%v: %s", err, lastLines(string(out), 5)))
-		} else {
-			log.Printf("[forge] deploy dev-%d success", slotID)
-			fm.forge.FinishDeploy(deployID, true, "")
-		}
-	}()
-
-	return deployID, nil
-}
-
-// DeployProd deploys to production from a repo directory (base repo or slot).
-func (fm *ForgeManager) DeployProd(project, repoDir, triggeredBy string) (int64, error) {
-	if fm.forge == nil {
-		return 0, fmt.Errorf("forge not available")
-	}
-
-	hash, msg := gitHeadInfo(repoDir)
-	branch := gitCurrentBranch(repoDir)
-
-	deployID, err := fm.forge.RecordDeploy(project, "prod", hash, msg, branch, triggeredBy)
-	if err != nil {
-		return 0, err
-	}
-
-	go func() {
-		cmd := exec.Command(expandHome("~/bin/deploy-prod.sh"), repoDir)
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			log.Printf("[forge] deploy prod failed: %v\n%s", err, out)
-			fm.forge.FinishDeploy(deployID, false, fmt.Sprintf("%v: %s", err, lastLines(string(out), 5)))
-		} else {
-			log.Printf("[forge] deploy prod success")
-			fm.forge.FinishDeploy(deployID, true, "")
-		}
-	}()
-
-	return deployID, nil
-}
-
-// DeployCommit checks out a specific commit in a slot and deploys it.
-func (fm *ForgeManager) DeployCommit(project string, slotID int, commitHash, triggeredBy string) (int64, error) {
-	if fm.forge == nil {
-		return 0, fmt.Errorf("forge not available")
-	}
-
-	slots, err := fm.forge.SlotStatus(project)
-	if err != nil {
-		return 0, err
-	}
-	var slot *forge.Slot
-	for _, s := range slots {
-		if s.ID == slotID {
-			slot = &s
-			break
-		}
-	}
-	if slot == nil {
-		return 0, fmt.Errorf("slot %d not found", slotID)
-	}
-
-	// Checkout the specific commit
-	cmd := exec.Command("git", "-C", slot.Path, "checkout", commitHash)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return 0, fmt.Errorf("git checkout %s: %v\n%s", commitHash, err, out)
-	}
-
-	return fm.DeployDev(project, slotID, triggeredBy)
-}
-
-// Deploys returns deploy history.
-func (fm *ForgeManager) Deploys(project, target string, limit int) ([]forge.Deploy, error) {
-	if fm.forge == nil {
-		return nil, fmt.Errorf("forge not available")
-	}
-	if project == "" {
-		return fm.forge.AllDeploys(limit)
-	}
-	return fm.forge.ListDeploys(project, target, limit)
-}
-
-// gitCurrentBranch returns the current branch name.
-func gitCurrentBranch(path string) string {
-	cmd := exec.Command("git", "-C", path, "rev-parse", "--abbrev-ref", "HEAD")
+	cmd := exec.Command("git", "-C", path, "rev-list", "--left-right", "--count", "HEAD...origin/main")
 	out, err := cmd.Output()
 	if err != nil {
-		return ""
+		return 0, 0
 	}
-	return strings.TrimSpace(string(out))
+	fmt.Sscanf(strings.TrimSpace(string(out)), "%d\t%d", &ahead, &behind)
+	return
 }
 
-// lastLines returns the last N lines of a string.
-func lastLines(s string, n int) string {
-	lines := strings.Split(strings.TrimSpace(s), "\n")
-	if len(lines) <= n {
-		return strings.TrimSpace(s)
-	}
-	return strings.Join(lines[len(lines)-n:], "\n")
-}
-
-// gitCommitTime returns the unix timestamp of the HEAD commit.
 func gitCommitTime(path string) int64 {
+	if path == "" {
+		return 0
+	}
 	cmd := exec.Command("git", "-C", path, "log", "-1", "--format=%ct")
 	out, err := cmd.Output()
 	if err != nil {
@@ -548,46 +346,149 @@ func gitCommitTime(path string) int64 {
 	return t
 }
 
-// gitAheadBehind returns how many commits ahead/behind origin/main a worktree is.
-// Uses cached refs — no network calls. Background fetch keeps refs fresh.
-func gitAheadBehind(path string) (ahead, behind int) {
-	cmd := exec.Command("git", "-C", path, "rev-list", "--left-right", "--count", "HEAD...origin/main")
+func gitCurrentBranch(path string) string {
+	cmd := exec.Command("git", "-C", path, "rev-parse", "--abbrev-ref", "HEAD")
 	out, err := cmd.Output()
 	if err != nil {
-		return 0, 0
+		return ""
 	}
-	fmt.Sscanf(strings.TrimSpace(string(out)), "%d\t%d", &ahead, &behind)
-	return
+	return strings.TrimSpace(string(out))
 }
 
-// autoCommitDirty commits any uncommitted changes in a worktree.
-// Skips .inber/ session artifacts.
 func autoCommitDirty(path, commitMsg string) {
-	// Check if dirty
 	cmd := exec.Command("git", "-C", path, "status", "--porcelain")
 	out, err := cmd.Output()
 	if err != nil || len(strings.TrimSpace(string(out))) == 0 {
 		return
 	}
-
-	// Add everything except .inber/
-	cmd = exec.Command("git", "-C", path, "add", "-A")
-	cmd.Run()
-	cmd = exec.Command("git", "-C", path, "reset", "HEAD", "--", ".inber/")
-	cmd.Run()
-
-	// Check if there's anything staged after excluding .inber
+	exec.Command("git", "-C", path, "add", "-A").Run()
+	exec.Command("git", "-C", path, "reset", "HEAD", "--", ".inber/").Run()
 	cmd = exec.Command("git", "-C", path, "diff", "--cached", "--quiet")
 	if cmd.Run() == nil {
-		return // nothing staged
+		return
 	}
-
-	cmd = exec.Command("git", "-C", path, "commit", "-m", commitMsg)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		log.Printf("[forge] auto-commit failed: %v\n%s", err, out)
-	} else {
-		log.Printf("[forge] auto-committed dirty files in %s", path)
-	}
+	exec.Command("git", "-C", path, "commit", "-m", commitMsg).Run()
 }
 
-// expandHome is in backend.go
+func lastLines(s string, n int) string {
+	lines := strings.Split(strings.TrimSpace(s), "\n")
+	if len(lines) <= n {
+		return strings.TrimSpace(s)
+	}
+	return strings.Join(lines[len(lines)-n:], "\n")
+}
+
+// API handler wrappers that were in main.go but depend on forge types
+
+func (ba *BusAgent) handleForgeStatus(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	status := ba.forge.Status()
+	if status == nil {
+		status = []ProjectStatus{}
+	}
+	json.NewEncoder(w).Encode(status)
+}
+
+func (ba *BusAgent) handleForgeDeploy(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	if r.Method == http.MethodOptions {
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Project     string `json:"project"`
+		Target      string `json:"target"`
+		Slot        int    `json:"slot"`
+		Commit      string `json:"commit"`
+		TriggeredBy string `json:"triggered_by"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		return
+	}
+	if req.Project == "" {
+		http.Error(w, `{"error":"project required"}`, http.StatusBadRequest)
+		return
+	}
+	if req.TriggeredBy == "" {
+		req.TriggeredBy = "dashboard"
+	}
+
+	var deployID int64
+	var err error
+	if req.Target == "prod" {
+		projects := ba.forge.Status()
+		var deployDir string
+		for _, p := range projects {
+			if p.ID == req.Project {
+				deployDir = p.BaseRepo
+			}
+		}
+		if deployDir == "" {
+			http.Error(w, `{"error":"project not found"}`, http.StatusNotFound)
+			return
+		}
+		deployID, err = ba.forge.DeployProd(req.Project, deployDir, req.TriggeredBy)
+	} else {
+		deployID, err = ba.forge.DeployDev(req.Project, req.Slot, req.TriggeredBy)
+	}
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{"deploy_id": deployID, "status": "running"})
+}
+
+func (ba *BusAgent) handleForgeRelease(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	if r.Method == http.MethodOptions {
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Project string `json:"project"`
+		Slot    int    `json:"slot"`
+		Clean   bool   `json:"clean"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		return
+	}
+	if req.Clean {
+		ba.forge.CleanSlot(req.Project, req.Slot)
+	}
+	ba.forge.ForceRelease(req.Project, req.Slot)
+	json.NewEncoder(w).Encode(map[string]string{"status": "released"})
+}
+
+func (ba *BusAgent) handleForgeDeploys(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	project := r.URL.Query().Get("project")
+	target := r.URL.Query().Get("target")
+	deploys, err := ba.forge.Deploys(project, target, 20)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	if deploys == nil {
+		json.NewEncoder(w).Encode([]struct{}{})
+		return
+	}
+	json.NewEncoder(w).Encode(deploys)
+}

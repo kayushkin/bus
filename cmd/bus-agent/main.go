@@ -632,6 +632,12 @@ func (ba *BusAgent) serveAPI() {
 	mux.HandleFunc("/api/forge/release", ba.handleForgeRelease)
 	mux.HandleFunc("/api/forge", ba.handleForgeStatus)
 	mux.HandleFunc("/api/forge/environments", ba.handleForgeEnvironments)
+	mux.HandleFunc("/api/forge/topology", ba.handleForgeTopology)
+	mux.HandleFunc("/api/forge/routes", ba.handleForgeRoutes)
+	mux.HandleFunc("/api/services", ba.handleServices)
+	mux.HandleFunc("/api/usage", ba.handleUsage)
+	mux.HandleFunc("/api/gateway/sessions", ba.handleGatewaySessions)
+	mux.HandleFunc("/api/gateway", ba.handleGateway)
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
@@ -641,17 +647,6 @@ func (ba *BusAgent) serveAPI() {
 	if err := http.ListenAndServe(":"+port, mux); err != nil {
 		log.Printf("[bus-agent] API server error: %v", err)
 	}
-}
-
-func (ba *BusAgent) handleForgeStatus(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-
-	status := ba.forge.Status()
-	if status == nil {
-		status = []ProjectStatus{}
-	}
-	json.NewEncoder(w).Encode(status)
 }
 
 func (ba *BusAgent) handleForgeEnvironments(w http.ResponseWriter, r *http.Request) {
@@ -664,141 +659,6 @@ func (ba *BusAgent) handleForgeEnvironments(w http.ResponseWriter, r *http.Reque
 		environments = []EnvironmentInfo{}
 	}
 	json.NewEncoder(w).Encode(environments)
-}
-
-func (ba *BusAgent) handleForgeDeploy(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	if r.Method == http.MethodOptions {
-		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-	if r.Method != http.MethodPost {
-		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
-		return
-	}
-
-	var req struct {
-		Project     string `json:"project"`
-		Target      string `json:"target"`      // "prod" or "dev-N"
-		Slot        int    `json:"slot"`         // slot number for dev deploys
-		Commit      string `json:"commit"`       // optional: deploy specific commit
-		TriggeredBy string `json:"triggered_by"` // who triggered
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
-		return
-	}
-	if req.Project == "" {
-		http.Error(w, `{"error":"project required"}`, http.StatusBadRequest)
-		return
-	}
-	if req.TriggeredBy == "" {
-		req.TriggeredBy = "dashboard"
-	}
-
-	var deployID int64
-	var err error
-
-	if req.Target == "prod" {
-		// Resolve deploy directory: use slot path if specified, otherwise base repo
-		projects := ba.forge.Status()
-		var deployDir string
-		for _, p := range projects {
-			if p.ID == req.Project {
-				if req.Slot >= 0 {
-					for _, s := range p.Slots {
-						if s.ID == req.Slot {
-							deployDir = s.Path
-						}
-					}
-				}
-				if deployDir == "" {
-					deployDir = p.BaseRepo
-				}
-			}
-		}
-		if deployDir == "" {
-			http.Error(w, `{"error":"project not found"}`, http.StatusNotFound)
-			return
-		}
-		if req.Commit != "" {
-			cmd := exec.Command("git", "-C", deployDir, "checkout", req.Commit)
-			if out, err := cmd.CombinedOutput(); err != nil {
-				http.Error(w, fmt.Sprintf(`{"error":"git checkout failed: %s"}`, string(out)), http.StatusInternalServerError)
-				return
-			}
-		}
-		deployID, err = ba.forge.DeployProd(req.Project, deployDir, req.TriggeredBy)
-	} else if req.Commit != "" {
-		deployID, err = ba.forge.DeployCommit(req.Project, req.Slot, req.Commit, req.TriggeredBy)
-	} else {
-		deployID, err = ba.forge.DeployDev(req.Project, req.Slot, req.TriggeredBy)
-	}
-
-	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
-		return
-	}
-
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"deploy_id": deployID,
-		"status":    "running",
-	})
-}
-
-func (ba *BusAgent) handleForgeRelease(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	if r.Method == http.MethodOptions {
-		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-	if r.Method != http.MethodPost {
-		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
-		return
-	}
-
-	var req struct {
-		Project string `json:"project"`
-		Slot    int    `json:"slot"`
-		Clean   bool   `json:"clean"` // reset to origin/main
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
-		return
-	}
-
-	if req.Clean {
-		ba.forge.CleanSlot(req.Project, req.Slot)
-	}
-	ba.forge.ForceRelease(req.Project, req.Slot)
-
-	json.NewEncoder(w).Encode(map[string]string{"status": "released"})
-}
-
-func (ba *BusAgent) handleForgeDeploys(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-
-	project := r.URL.Query().Get("project")
-	target := r.URL.Query().Get("target")
-	limit := 20
-
-	deploys, err := ba.forge.Deploys(project, target, limit)
-	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
-		return
-	}
-	if deploys == nil {
-		json.NewEncoder(w).Encode([]struct{}{})
-		return
-	}
-	json.NewEncoder(w).Encode(deploys)
 }
 
 func (ba *BusAgent) handleModelTest(w http.ResponseWriter, r *http.Request) {
