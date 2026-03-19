@@ -5,6 +5,7 @@ type ChatDelta struct {
 	Text      string `json:"text"`
 	Agent     string `json:"agent"`
 	SessionID string `json:"session_id"`
+	StreamID  string `json:"stream_id,omitempty"` // unique per turn/response (for frontend message grouping)
 	Done      bool   `json:"done,omitempty"`
 	Type      string `json:"type"`              // "text", "thinking", "tool", "done", "no_reply", "system", "heartbeat"
 	Category  string `json:"category,omitempty"` // "spawn_result", "subagent_summary", etc.
