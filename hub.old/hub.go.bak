@@ -33,8 +33,8 @@ func New(s *store.Store) *Hub {
 }
 
 // Publish persists a message and fans out to live subscribers.
-func (h *Hub) Publish(topic string, payload json.RawMessage, source string) (*store.Message, error) {
-	msg, err := h.store.Publish(topic, payload, source)
+func (h *Hub) Publish(topic string, payload json.RawMessage, source, msgType string) (*store.Message, error) {
+	msg, err := h.store.Publish(topic, payload, source, msgType)
 	if err != nil {
 		return nil, err
 	}

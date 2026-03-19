@@ -15,6 +15,19 @@ import (
 	"github.com/kayushkin/bus/store"
 )
 
+// publishOptions holds optional parameters for Publish.
+type publishOptions struct {
+	msgType string
+}
+
+// PublishOption configures a Publish call.
+type PublishOption func(*publishOptions)
+
+// WithType sets the message type field.
+func WithType(t string) PublishOption {
+	return func(o *publishOptions) { o.msgType = t }
+}
+
 // Client connects to the bus over HTTP and WebSocket.
 type Client struct {
 	baseURL    string
@@ -40,16 +53,24 @@ func New(baseURL, token, consumer string) *Client {
 }
 
 // Publish sends a message to a topic.
-func (c *Client) Publish(topic string, payload interface{}, source string) (*store.Message, error) {
+func (c *Client) Publish(topic string, payload interface{}, source string, opts ...PublishOption) (*store.Message, error) {
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
+	}
+
+	o := publishOptions{}
+	for _, opt := range opts {
+		opt(&o)
 	}
 
 	body := map[string]interface{}{
 		"topic":   topic,
 		"payload": json.RawMessage(data),
 		"source":  source,
+	}
+	if o.msgType != "" {
+		body["type"] = o.msgType
 	}
 
 	resp, err := c.post("/publish", body)

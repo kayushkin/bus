@@ -73,6 +73,7 @@ func main() {
 	mux.HandleFunc("POST /publish", auth(func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			Topic   string          `json:"topic"`
+			Type    string          `json:"type"`
 			Payload json.RawMessage `json:"payload"`
 			Source  string          `json:"source"`
 		}
@@ -85,7 +86,7 @@ func main() {
 			return
 		}
 
-		msg, err := h.Publish(req.Topic, req.Payload, req.Source)
+		msg, err := h.Publish(req.Topic, req.Payload, req.Source, req.Type)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -211,6 +212,7 @@ func main() {
 				var cmd struct {
 					Action  string          `json:"action"` // "publish" or "ack"
 					Topic   string          `json:"topic"`
+					Type    string          `json:"type"`
 					Payload json.RawMessage `json:"payload"`
 					Source  string          `json:"source"`
 					ID      int64           `json:"id"` // for ack
@@ -222,7 +224,7 @@ func main() {
 				switch cmd.Action {
 				case "publish":
 					if cmd.Topic != "" {
-						h.Publish(cmd.Topic, cmd.Payload, cmd.Source)
+						h.Publish(cmd.Topic, cmd.Payload, cmd.Source, cmd.Type)
 					}
 				case "ack":
 					if cmd.Topic != "" && cmd.ID > 0 {

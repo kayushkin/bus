@@ -14,8 +14,9 @@ import (
 type Message struct {
 	ID        int64           `json:"id"`
 	Topic     string          `json:"topic"`
-	Payload   json.RawMessage `json:"payload"`
+	Type      string          `json:"type,omitempty"`
 	Source    string          `json:"source,omitempty"`
+	Payload   json.RawMessage `json:"payload"`
 	CreatedAt time.Time       `json:"created_at"`
 }
 
@@ -47,6 +48,7 @@ func migrate(db *sql.DB) error {
 			topic      TEXT    NOT NULL,
 			payload    TEXT    NOT NULL,
 			source     TEXT    NOT NULL DEFAULT '',
+			type       TEXT    NOT NULL DEFAULT '',
 			created_at TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 		);
 
@@ -61,17 +63,23 @@ func migrate(db *sql.DB) error {
 			PRIMARY KEY (consumer_id, topic)
 		);
 	`)
+	if err != nil {
+		return err
+	}
+
+	// Migration: add type column to existing databases.
+	db.Exec(`ALTER TABLE messages ADD COLUMN type TEXT NOT NULL DEFAULT ''`)
 	return err
 }
 
 // Publish inserts a message and returns its ID.
-func (s *Store) Publish(topic string, payload json.RawMessage, source string) (*Message, error) {
+func (s *Store) Publish(topic string, payload json.RawMessage, source, msgType string) (*Message, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	res, err := s.db.Exec(
-		`INSERT INTO messages (topic, payload, source) VALUES (?, ?, ?)`,
-		topic, string(payload), source,
+		`INSERT INTO messages (topic, payload, source, type) VALUES (?, ?, ?, ?)`,
+		topic, string(payload), source, msgType,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("insert: %w", err)
@@ -82,8 +90,9 @@ func (s *Store) Publish(topic string, payload json.RawMessage, source string) (*
 	msg := &Message{
 		ID:        id,
 		Topic:     topic,
-		Payload:   payload,
+		Type:      msgType,
 		Source:    source,
+		Payload:   payload,
 		CreatedAt: time.Now().UTC(),
 	}
 	return msg, nil
@@ -99,7 +108,7 @@ func (s *Store) Since(topic string, afterID int64, limit int) ([]Message, error)
 	}
 
 	rows, err := s.db.Query(
-		`SELECT id, topic, payload, source, created_at FROM messages
+		`SELECT id, topic, payload, source, type, created_at FROM messages
 		 WHERE topic = ? AND id > ? ORDER BY id ASC LIMIT ?`,
 		topic, afterID, limit,
 	)
@@ -121,7 +130,7 @@ func (s *Store) History(topic string, limit int) ([]Message, error) {
 	}
 
 	rows, err := s.db.Query(
-		`SELECT id, topic, payload, source, created_at FROM messages
+		`SELECT id, topic, payload, source, type, created_at FROM messages
 		 WHERE topic = ? ORDER BY id DESC LIMIT ?`,
 		topic, limit,
 	)
@@ -255,7 +264,7 @@ func scanMessages(rows *sql.Rows) ([]Message, error) {
 		var m Message
 		var payload string
 		var createdAt string
-		if err := rows.Scan(&m.ID, &m.Topic, &payload, &m.Source, &createdAt); err != nil {
+		if err := rows.Scan(&m.ID, &m.Topic, &payload, &m.Source, &m.Type, &createdAt); err != nil {
 			return nil, err
 		}
 		m.Payload = json.RawMessage(payload)
