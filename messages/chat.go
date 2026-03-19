@@ -17,16 +17,18 @@ type ChatInbound struct {
 
 // ChatOutbound represents an outgoing agent response published to bus.
 type ChatOutbound struct {
-	Text         string        `json:"text"`
-	Agent        string        `json:"agent"`
-	Author       string        `json:"author"`
-	Channel      string        `json:"channel"`
-	Orchestrator string        `json:"orchestrator,omitempty"`
-	Stream       string        `json:"stream,omitempty"`
-	StreamID     string        `json:"stream_id,omitempty"`
-	Tool         string        `json:"tool,omitempty"`
-	Timestamp    time.Time     `json:"timestamp"`
-	Meta         *OutboundMeta `json:"meta,omitempty"`
+	Text          string        `json:"text"`
+	Agent         string        `json:"agent"`
+	Author        string        `json:"author"`
+	Channel       string        `json:"channel"`
+	Orchestrator  string        `json:"orchestrator,omitempty"`
+	Session       string        `json:"session,omitempty"`       // session key (e.g. "agent:main:main")
+	ParentSession string        `json:"parent_session,omitempty"` // parent session key if sub-agent
+	Stream        string        `json:"stream,omitempty"`
+	StreamID      string        `json:"stream_id,omitempty"`
+	Tool          string        `json:"tool,omitempty"`
+	Timestamp     time.Time     `json:"timestamp"`
+	Meta          *OutboundMeta `json:"meta,omitempty"`
 }
 
 // OutboundMeta holds token/cost statistics for a response.
