@@ -30,7 +30,7 @@ func resolve(v string) string {
 // NewChatDelta creates a ChatDelta with all required fields.
 // Pass Intentionally instead of "" to explicitly leave a field empty.
 // Empty strings for required fields will cause a panic.
-func NewChatDelta(agent, orchestrator, sessionID, streamID, deltaType string) ChatDelta {
+func NewChatDelta(agent, orchestrator, sessionID, turnID, deltaType string) ChatDelta {
 	var missing []string
 	if agent == "" {
 		missing = append(missing, "agent")
@@ -41,8 +41,8 @@ func NewChatDelta(agent, orchestrator, sessionID, streamID, deltaType string) Ch
 	if sessionID == "" {
 		missing = append(missing, "sessionID")
 	}
-	if streamID == "" {
-		missing = append(missing, "streamID")
+	if turnID == "" {
+		missing = append(missing, "turnID")
 	}
 	if deltaType == "" {
 		missing = append(missing, "type")
@@ -50,18 +50,20 @@ func NewChatDelta(agent, orchestrator, sessionID, streamID, deltaType string) Ch
 	if len(missing) > 0 {
 		panic(fmt.Sprintf("messages.NewChatDelta: required fields empty: %s (use messages.Intentionally for deliberate empty)", strings.Join(missing, ", ")))
 	}
+	resolved := resolve(turnID)
 	return ChatDelta{
 		Agent:        resolve(agent),
 		Orchestrator: resolve(orchestrator),
 		SessionID:    resolve(sessionID),
-		StreamID:     resolve(streamID),
+		TurnID:       resolved,
+		StreamID:     resolved, // backward compat
 		Type:         resolve(deltaType),
 	}
 }
 
 // NewDoneDelta creates a done ChatDelta with optional meta.
-func NewDoneDelta(agent, orchestrator, sessionID, streamID string, meta map[string]any) ChatDelta {
-	d := NewChatDelta(agent, orchestrator, sessionID, streamID, "done")
+func NewDoneDelta(agent, orchestrator, sessionID, turnID string, meta map[string]any) ChatDelta {
+	d := NewChatDelta(agent, orchestrator, sessionID, turnID, "done")
 	d.Done = true
 	d.Meta = meta
 	return d

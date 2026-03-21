@@ -23,9 +23,10 @@ type ChatOutbound struct {
 	Channel       string        `json:"channel"`
 	Orchestrator  string        `json:"orchestrator,omitempty"`
 	Session       string        `json:"session,omitempty"`       // session key (e.g. "agent:main:main")
+	TurnID        string        `json:"turn_id,omitempty"`       // unique within session (inber: turn number, openclaw: message id)
 	ParentSession string        `json:"parent_session,omitempty"` // parent session key if sub-agent
 	Stream        string        `json:"stream,omitempty"`
-	StreamID      string        `json:"stream_id,omitempty"`
+	StreamID      string        `json:"stream_id,omitempty"`     // deprecated: use TurnID instead
 	Tool          string        `json:"tool,omitempty"`
 	Timestamp     time.Time     `json:"timestamp"`
 	Meta          *OutboundMeta `json:"meta,omitempty"`

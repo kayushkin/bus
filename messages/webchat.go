@@ -6,8 +6,9 @@ type ChatDelta struct {
 	Agent         string         `json:"agent"`
 	Orchestrator  string         `json:"orchestrator,omitempty"`
 	SessionID     string         `json:"session_id"`
+	TurnID        string         `json:"turn_id,omitempty"`        // unique within session (inber: turn number, openclaw: message id)
 	ParentSession string         `json:"parent_session,omitempty"` // parent session key if sub-agent
-	StreamID      string         `json:"stream_id,omitempty"`      // unique per turn/response (for frontend message grouping)
+	StreamID      string         `json:"stream_id,omitempty"`      // deprecated: use TurnID instead
 	Done          bool           `json:"done,omitempty"`
 	Type          string         `json:"type"`                     // "text", "thinking", "tool", "tool_result", "done", "no_reply", "system", "heartbeat"
 	Tool          string         `json:"tool,omitempty"`           // tool name for type="tool"/"tool_result"
