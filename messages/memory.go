@@ -23,6 +23,7 @@ type Memory struct {
 	RefType      string     `json:"ref_type"`
 	RefTarget    string     `json:"ref_target"`
 	IsLazy       bool       `json:"is_lazy"`
+	Orchestrator string     `json:"orchestrator,omitempty"`
 }
 
 // BuildContextRequest specifies how to build context from memory
@@ -80,7 +81,8 @@ type CompactionResult struct {
 
 // MemorySaveRequest - memory.save
 type MemorySaveRequest struct {
-	Memory Memory `json:"memory"`
+	Orchestrator string `json:"orchestrator"` // "inber", "openclaw", etc.
+	Memory       Memory `json:"memory"`
 }
 
 type MemorySaveResponse struct {
@@ -90,7 +92,8 @@ type MemorySaveResponse struct {
 
 // MemoryGetRequest - memory.get
 type MemoryGetRequest struct {
-	ID string `json:"id"`
+	Orchestrator string `json:"orchestrator,omitempty"`
+	ID           string `json:"id"`
 }
 
 type MemoryGetResponse struct {
@@ -100,8 +103,9 @@ type MemoryGetResponse struct {
 
 // MemorySearchRequest - memory.search
 type MemorySearchRequest struct {
-	Query string `json:"query"`
-	Limit int    `json:"limit"`
+	Orchestrator string `json:"orchestrator,omitempty"` // filter by orchestrator; empty = all
+	Query        string `json:"query"`
+	Limit        int    `json:"limit"`
 }
 
 type MemorySearchResponse struct {
@@ -130,6 +134,7 @@ type MemoryDecayResponse struct {
 
 // MemoryListRequest - memory.list
 type MemoryListRequest struct {
+	Orchestrator  string  `json:"orchestrator,omitempty"` // filter by orchestrator; empty = all
 	Limit         int     `json:"limit"`
 	MinImportance float64 `json:"min_importance"`
 }
