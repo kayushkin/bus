@@ -208,6 +208,27 @@ type MemorySessionSaveResponse struct {
 	Error   string `json:"error,omitempty"`
 }
 
+// MemoryCompareRequest - memory.compare
+// Returns memories from multiple orchestrators for side-by-side comparison.
+type MemoryCompareRequest struct {
+	Query         string   `json:"query"`                    // search query (empty = list recent)
+	Orchestrators []string `json:"orchestrators"`            // orchestrators to compare (empty = all)
+	Limit         int      `json:"limit"`                    // max per orchestrator
+	MinImportance float64  `json:"min_importance,omitempty"` // filter threshold
+}
+
+// MemoryCompareGroup holds memories for one orchestrator.
+type MemoryCompareGroup struct {
+	Orchestrator string   `json:"orchestrator"`
+	Memories     []Memory `json:"memories"`
+	Total        int      `json:"total"` // total count for this orchestrator
+}
+
+type MemoryCompareResponse struct {
+	Groups []MemoryCompareGroup `json:"groups"`
+	Error  string               `json:"error,omitempty"`
+}
+
 // MemoryTrackUsageRequest - memory.track-usage
 type MemoryTrackUsageRequest struct {
 	MemoryID   string `json:"memory_id"`
