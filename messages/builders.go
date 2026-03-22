@@ -6,10 +6,8 @@ import (
 	"time"
 )
 
-// --- ChatDelta constructors ---
-
 // NewChatDelta creates a ChatDelta with all required fields.
-// Empty strings panic — every field is required, no exceptions.
+// Empty strings panic — every field is required.
 func NewChatDelta(agent, orchestrator, sessionID, deltaType string) ChatDelta {
 	var missing []string
 	if agent == "" {
@@ -42,11 +40,8 @@ func NewDoneDelta(agent, orchestrator, sessionID string, stats *TurnStats) ChatD
 	return d
 }
 
-// --- ChatOutbound constructors ---
-
-// NewChatOutbound creates a ChatOutbound with all required fields.
-// Empty strings panic — every field is required, no exceptions.
-func NewChatOutbound(agent, orchestrator, channel, stream string) ChatOutbound {
+// NewChatOutbound creates a completed response message.
+func NewChatOutbound(agent, orchestrator, sessionID, text string) ChatOutbound {
 	var missing []string
 	if agent == "" {
 		missing = append(missing, "agent")
@@ -54,11 +49,11 @@ func NewChatOutbound(agent, orchestrator, channel, stream string) ChatOutbound {
 	if orchestrator == "" {
 		missing = append(missing, "orchestrator")
 	}
-	if channel == "" {
-		missing = append(missing, "channel")
+	if sessionID == "" {
+		missing = append(missing, "sessionID")
 	}
-	if stream == "" {
-		missing = append(missing, "stream")
+	if text == "" {
+		missing = append(missing, "text")
 	}
 	if len(missing) > 0 {
 		panic(fmt.Sprintf("messages.NewChatOutbound: required fields empty: %s", strings.Join(missing, ", ")))
@@ -66,16 +61,13 @@ func NewChatOutbound(agent, orchestrator, channel, stream string) ChatOutbound {
 	return ChatOutbound{
 		Agent:        agent,
 		Orchestrator: orchestrator,
-		Channel:      channel,
-		Stream:       stream,
+		SessionID:    sessionID,
+		Text:         text,
 		Timestamp:    time.Now(),
 	}
 }
 
-// --- Validation ---
-
 // ValidateChatDelta checks that required fields are populated.
-// Returns error describing which fields are missing.
 func ValidateChatDelta(d ChatDelta) error {
 	var missing []string
 	if d.Agent == "" {
@@ -92,27 +84,6 @@ func ValidateChatDelta(d ChatDelta) error {
 	}
 	if len(missing) > 0 {
 		return fmt.Errorf("ChatDelta missing required fields: %s", strings.Join(missing, ", "))
-	}
-	return nil
-}
-
-// ValidateChatOutbound checks that required fields are populated.
-func ValidateChatOutbound(d ChatOutbound) error {
-	var missing []string
-	if d.Agent == "" {
-		missing = append(missing, "agent")
-	}
-	if d.Orchestrator == "" {
-		missing = append(missing, "orchestrator")
-	}
-	if d.Channel == "" {
-		missing = append(missing, "channel")
-	}
-	if d.Stream == "" {
-		missing = append(missing, "stream")
-	}
-	if len(missing) > 0 {
-		return fmt.Errorf("ChatOutbound missing required fields: %s", strings.Join(missing, ", "))
 	}
 	return nil
 }
