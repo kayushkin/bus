@@ -6,31 +6,11 @@ import (
 	"time"
 )
 
-// Intentionally is a sentinel value for required string fields that are
-// deliberately left empty. Use this instead of "" to signal intent:
-//
-//	NewChatDelta(messages.Intentionally, "openclaw", sessionID, streamID, "done")
-const Intentionally = "\x00intentionally_empty"
-
-// isSet returns true if the value is non-empty and not the Intentionally sentinel.
-func isSet(v string) bool {
-	return v != "" && v != Intentionally
-}
-
-// resolve returns "" if v is the Intentionally sentinel, otherwise v as-is.
-func resolve(v string) string {
-	if v == Intentionally {
-		return ""
-	}
-	return v
-}
-
 // --- ChatDelta constructors ---
 
 // NewChatDelta creates a ChatDelta with all required fields.
-// Pass Intentionally instead of "" to explicitly leave a field empty.
-// Empty strings for required fields will cause a panic.
-func NewChatDelta(agent, orchestrator, sessionID, turnID, deltaType string) ChatDelta {
+// Empty strings panic — every field is required, no exceptions.
+func NewChatDelta(agent, orchestrator, sessionID, deltaType string) ChatDelta {
 	var missing []string
 	if agent == "" {
 		missing = append(missing, "agent")
@@ -41,39 +21,31 @@ func NewChatDelta(agent, orchestrator, sessionID, turnID, deltaType string) Chat
 	if sessionID == "" {
 		missing = append(missing, "sessionID")
 	}
-	if turnID == "" {
-		missing = append(missing, "turnID")
-	}
 	if deltaType == "" {
 		missing = append(missing, "type")
 	}
 	if len(missing) > 0 {
-		panic(fmt.Sprintf("messages.NewChatDelta: required fields empty: %s (use messages.Intentionally for deliberate empty)", strings.Join(missing, ", ")))
+		panic(fmt.Sprintf("messages.NewChatDelta: required fields empty: %s", strings.Join(missing, ", ")))
 	}
-	resolved := resolve(turnID)
 	return ChatDelta{
-		Agent:        resolve(agent),
-		Orchestrator: resolve(orchestrator),
-		SessionID:    resolve(sessionID),
-		TurnID:       resolved,
-		StreamID:     resolved, // backward compat
-		Type:         resolve(deltaType),
+		Agent:        agent,
+		Orchestrator: orchestrator,
+		SessionID:    sessionID,
+		Type:         deltaType,
 	}
 }
 
-// NewDoneDelta creates a done ChatDelta with optional meta.
-func NewDoneDelta(agent, orchestrator, sessionID, turnID string, meta map[string]any) ChatDelta {
-	d := NewChatDelta(agent, orchestrator, sessionID, turnID, "done")
-	d.Done = true
-	d.Meta = meta
+// NewDoneDelta creates a done ChatDelta with optional stats.
+func NewDoneDelta(agent, orchestrator, sessionID string, stats *TurnStats) ChatDelta {
+	d := NewChatDelta(agent, orchestrator, sessionID, "done")
+	d.Stats = stats
 	return d
 }
 
 // --- ChatOutbound constructors ---
 
 // NewChatOutbound creates a ChatOutbound with all required fields.
-// Pass Intentionally instead of "" to explicitly leave a field empty.
-// Empty strings for required fields will cause a panic.
+// Empty strings panic — every field is required, no exceptions.
 func NewChatOutbound(agent, orchestrator, channel, stream string) ChatOutbound {
 	var missing []string
 	if agent == "" {
@@ -89,13 +61,13 @@ func NewChatOutbound(agent, orchestrator, channel, stream string) ChatOutbound {
 		missing = append(missing, "stream")
 	}
 	if len(missing) > 0 {
-		panic(fmt.Sprintf("messages.NewChatOutbound: required fields empty: %s (use messages.Intentionally for deliberate empty)", strings.Join(missing, ", ")))
+		panic(fmt.Sprintf("messages.NewChatOutbound: required fields empty: %s", strings.Join(missing, ", ")))
 	}
 	return ChatOutbound{
-		Agent:        resolve(agent),
-		Orchestrator: resolve(orchestrator),
-		Channel:      resolve(channel),
-		Stream:       resolve(stream),
+		Agent:        agent,
+		Orchestrator: orchestrator,
+		Channel:      channel,
+		Stream:       stream,
 		Timestamp:    time.Now(),
 	}
 }
@@ -103,6 +75,7 @@ func NewChatOutbound(agent, orchestrator, channel, stream string) ChatOutbound {
 // --- Validation ---
 
 // ValidateChatDelta checks that required fields are populated.
+// Returns error describing which fields are missing.
 func ValidateChatDelta(d ChatDelta) error {
 	var missing []string
 	if d.Agent == "" {
@@ -113,9 +86,6 @@ func ValidateChatDelta(d ChatDelta) error {
 	}
 	if d.SessionID == "" {
 		missing = append(missing, "session_id")
-	}
-	if d.StreamID == "" {
-		missing = append(missing, "stream_id")
 	}
 	if d.Type == "" {
 		missing = append(missing, "type")
