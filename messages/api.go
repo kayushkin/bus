@@ -34,6 +34,7 @@ type AgentEntry struct {
 	Emoji        string `json:"emoji,omitempty"`
 	Project      string `json:"project,omitempty"`
 	Enabled      bool   `json:"enabled"`
+	IsDefault    bool   `json:"is_default,omitempty"`
 }
 
 // --- Sessions domain (orchestrators) ---
