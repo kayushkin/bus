@@ -119,7 +119,7 @@ func (c *Client) EnsureStreams() error {
 	streams := []nats.StreamConfig{
 		{
 			Name:     "CHAT",
-			Subjects: []string{"chat.completed"},
+			Subjects: []string{"chat.outbound"},
 			MaxAge:   30 * 24 * time.Hour,
 		},
 		{
