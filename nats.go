@@ -65,6 +65,14 @@ func (c *Client) Subscribe(subject string, handler func(subject string, data []b
 	})
 }
 
+// QueueSubscribe subscribes to a subject with a queue group.
+// Only one member of the queue group receives each message.
+func (c *Client) QueueSubscribe(subject, queue string, handler func(subject string, data []byte)) (*nats.Subscription, error) {
+	return c.nc.QueueSubscribe(subject, queue, func(msg *nats.Msg) {
+		handler(msg.Subject, msg.Data)
+	})
+}
+
 // Request sends a request and waits for a reply.
 func (c *Client) Request(subject string, data any, timeout time.Duration) ([]byte, error) {
 	b, err := json.Marshal(data)
@@ -79,8 +87,10 @@ func (c *Client) Request(subject string, data any, timeout time.Duration) ([]byt
 }
 
 // Reply subscribes to a subject and sends responses back.
+// Uses a queue group based on the subject name to ensure only one handler
+// processes each request when multiple instances are running.
 func (c *Client) Reply(subject string, handler func(data []byte) (any, error)) (*nats.Subscription, error) {
-	return c.nc.Subscribe(subject, func(msg *nats.Msg) {
+	return c.nc.QueueSubscribe(subject, subject+"-workers", func(msg *nats.Msg) {
 		resp, err := handler(msg.Data)
 		if err != nil {
 			_ = msg.Respond([]byte(fmt.Sprintf(`{"error":%q}`, err.Error())))
