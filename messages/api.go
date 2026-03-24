@@ -29,8 +29,7 @@ type APIResponse struct {
 // AgentEntry is a registered agent with its orchestrator association.
 type AgentEntry struct {
 	Name         string `json:"name"`                    // orchestrator-specific ID (for routing)
-	Slug         string `json:"slug,omitempty"`           // canonical identity across orchestrators
-	DisplayName  string `json:"display_name,omitempty"`   // human-friendly name
+	DisplayName  string `json:"display_name,omitempty"`   // canonical display name from agent-store
 	Orchestrator string `json:"orchestrator"`
 	Description  string `json:"description,omitempty"`
 	Emoji        string `json:"emoji,omitempty"`
