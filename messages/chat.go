@@ -29,6 +29,7 @@ type ChatDelta struct {
 	ToolInput    string     `json:"tool_input,omitempty"`
 	ToolOutput   string     `json:"tool_output,omitempty"`
 	Stats        *TurnStats `json:"stats,omitempty"` // on type=done
+	Hidden       bool       `json:"hidden,omitempty"` // entry is logged but should not display in frontends
 }
 
 // TurnStats contains token usage and cost info for a completed turn.
