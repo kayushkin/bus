@@ -11,6 +11,7 @@ type ChatInbound struct {
 	Agent        string    `json:"agent,omitempty"`
 	Orchestrator string    `json:"orchestrator,omitempty"` // "inber", "openclaw", etc.
 	Channel      string    `json:"channel,omitempty"`      // "webchat", "discord", etc.
+	SessionID    string    `json:"session_id,omitempty"`   // logical session for conversation continuity
 	Timestamp    time.Time `json:"timestamp"`
 }
 
@@ -38,12 +39,26 @@ type TurnStats struct {
 	OutputTokens     int         `json:"output_tokens"`
 	CacheReadTokens  int         `json:"cache_read_tokens,omitempty"`
 	CacheWriteTokens int         `json:"cache_write_tokens,omitempty"`
+	ContextTokens    int         `json:"context_tokens,omitempty"`  // actual context from last API call in the turn
+	ContextLimit     int         `json:"context_limit,omitempty"`   // context window size reported by the model
 	Cost             float64     `json:"cost,omitempty"`
 	DurationMs       int         `json:"duration_ms,omitempty"`
+	DurationAPIMs    int         `json:"duration_api_ms,omitempty"` // time spent in API calls only
+	NumTurns         int         `json:"num_turns,omitempty"`       // total agentic turns in this run
 	Model            string      `json:"model,omitempty"`
 	Turn             int         `json:"turn,omitempty"`
 	ToolCalls        int         `json:"tool_calls,omitempty"`
 	Tools            []ToolEvent `json:"tools,omitempty"`
+	APICalls         int            `json:"api_calls,omitempty"`       // number of API round-trips
+	APICallUsages    []APICallUsage `json:"api_call_usages,omitempty"` // per-call token breakdown
+}
+
+// APICallUsage records token usage for a single API round-trip within a turn.
+type APICallUsage struct {
+	InputTokens      int `json:"input_tokens"`
+	OutputTokens     int `json:"output_tokens"`
+	CacheReadTokens  int `json:"cache_read_tokens,omitempty"`
+	CacheWriteTokens int `json:"cache_write_tokens,omitempty"`
 }
 
 // ToolEvent describes a single tool invocation within a turn.
