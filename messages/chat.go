@@ -1,6 +1,9 @@
 package messages
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 // === chat.inbound ===
 
@@ -12,6 +15,8 @@ type ChatInbound struct {
 	Orchestrator string    `json:"orchestrator,omitempty"` // "inber", "openclaw", etc.
 	Channel      string    `json:"channel,omitempty"`      // "webchat", "discord", etc.
 	SessionID    string    `json:"session_id,omitempty"`   // logical session for conversation continuity
+	Model        string    `json:"model,omitempty"`        // model override for this session
+	Effort       string    `json:"effort,omitempty"`       // reasoning effort: low, medium, high, max
 	Timestamp    time.Time `json:"timestamp"`
 }
 
@@ -20,17 +25,23 @@ type ChatInbound struct {
 // ChatDelta represents a streaming event on chat.stream.
 // Types: text, thinking, tool, tool_result, done, spawn_started, spawn_completed
 type ChatDelta struct {
-	Agent        string     `json:"agent"`
-	Orchestrator string     `json:"orchestrator"`
-	SessionID    string     `json:"session_id"`
-	CompletionID string     `json:"completion_id,omitempty"`
-	Type         string     `json:"type"`
-	Text         string     `json:"text,omitempty"`
-	Tool         string     `json:"tool,omitempty"`
-	ToolInput    string     `json:"tool_input,omitempty"`
-	ToolOutput   string     `json:"tool_output,omitempty"`
-	Stats        *TurnStats `json:"stats,omitempty"` // on type=done
-	Hidden       bool       `json:"hidden,omitempty"` // entry is logged but should not display in frontends
+	Agent        string          `json:"agent"`
+	Orchestrator string          `json:"orchestrator"`
+	SessionID    string          `json:"session_id"`
+	CompletionID string          `json:"completion_id,omitempty"`
+	Type         string          `json:"type"`
+	Subtype      string          `json:"subtype,omitempty"`      // e.g. "init", "compact_boundary" for system events
+	MessageID    string          `json:"message_id,omitempty"`   // assistant message ID from CC
+	Text         string          `json:"text,omitempty"`
+	Tool         string          `json:"tool,omitempty"`
+	ToolID       string          `json:"tool_id,omitempty"`      // content block ID for tool_use
+	ToolInput    string          `json:"tool_input,omitempty"`
+	ToolOutput   string          `json:"tool_output,omitempty"`
+	IsError      bool            `json:"is_error,omitempty"`     // true when result was an error
+	Stats        *TurnStats      `json:"stats,omitempty"`        // on type=done/completed
+	Hidden       bool            `json:"hidden,omitempty"`       // entry is logged but should not display in frontends
+	Timestamp    time.Time       `json:"timestamp,omitempty"`    // when the event was produced
+	RawLog       json.RawMessage `json:"raw_log,omitempty"`      // full CC stream-json line for logstack
 }
 
 // TurnStats contains token usage and cost info for a completed turn.
@@ -74,11 +85,13 @@ type ToolEvent struct {
 // ChatOutbound represents a completed agent response on chat.outbound (JetStream).
 // This is the source of truth for what was said — used for history and persistence.
 type ChatOutbound struct {
-	Agent        string     `json:"agent"`
-	Orchestrator string     `json:"orchestrator"`
-	SessionID    string     `json:"session_id"`
-	CompletionID string     `json:"completion_id,omitempty"`
-	Text         string     `json:"text"`
-	Stats        *TurnStats `json:"stats,omitempty"`
-	Timestamp    time.Time  `json:"timestamp"`
+	Agent        string          `json:"agent"`
+	Orchestrator string          `json:"orchestrator"`
+	SessionID    string          `json:"session_id"`
+	CompletionID string          `json:"completion_id,omitempty"`
+	Text         string          `json:"text"`
+	IsError      bool            `json:"is_error,omitempty"`  // true when result was an error
+	Stats        *TurnStats      `json:"stats,omitempty"`
+	Timestamp    time.Time       `json:"timestamp"`
+	RawLog       json.RawMessage `json:"raw_log,omitempty"`   // full CC result event for logstack
 }

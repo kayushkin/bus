@@ -41,18 +41,26 @@ type AgentEntry struct {
 
 // --- Sessions domain (orchestrators) ---
 
+// SessionTodo is a single task item tracked via TodoWrite tool calls.
+type SessionTodo struct {
+	Content    string `json:"content"`
+	Status     string `json:"status"` // pending, in_progress, completed
+	ActiveForm string `json:"activeForm,omitempty"`
+}
+
 // SessionEntry represents an active or recent session from any orchestrator.
 type SessionEntry struct {
-	ID            string `json:"id"`
-	Agent         string `json:"agent"`
-	Orchestrator  string `json:"orchestrator"`
-	Status        string `json:"status"`                   // idle, running, completed, error
-	SpawnDepth    int    `json:"spawn_depth,omitempty"`
-	ParentKey     string `json:"parent_key,omitempty"`
-	Messages      int    `json:"messages,omitempty"`
-	CreatedAt     string `json:"created_at,omitempty"`
-	LastActive    string `json:"last_active,omitempty"`
-	ActiveRequest string `json:"active_request,omitempty"` // current input text if running
+	ID            string        `json:"id"`
+	Agent         string        `json:"agent"`
+	Orchestrator  string        `json:"orchestrator"`
+	Status        string        `json:"status"`                   // idle, running, completed, error
+	SpawnDepth    int           `json:"spawn_depth,omitempty"`
+	ParentKey     string        `json:"parent_key,omitempty"`
+	Messages      int           `json:"messages,omitempty"`
+	CreatedAt     string        `json:"created_at,omitempty"`
+	LastActive    string        `json:"last_active,omitempty"`
+	ActiveRequest string        `json:"active_request,omitempty"` // current input text if running
+	Todos         []SessionTodo `json:"todos,omitempty"`          // latest task list from TodoWrite
 }
 
 // --- Usage domain (model-store) ---
@@ -67,13 +75,14 @@ type UsageQuery struct {
 
 // UsageEntry is a single usage record.
 type UsageEntry struct {
-	Date         string  `json:"date"`
+	Date         string  `json:"date,omitempty"`
 	Agent        string  `json:"agent"`
 	Orchestrator string  `json:"orchestrator,omitempty"`
 	Model        string  `json:"model"`
 	Provider     string  `json:"provider,omitempty"`
 	InputTokens  int64   `json:"input_tokens"`
 	OutputTokens int64   `json:"output_tokens"`
+	TotalTokens  int64   `json:"total_tokens"`
 	Requests     int     `json:"requests"`
 	CostUSD      float64 `json:"cost_usd"`
 }
