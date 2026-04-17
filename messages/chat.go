@@ -16,7 +16,7 @@ type ChatInbound struct {
 	Channel      string    `json:"channel,omitempty"`      // "webchat", "discord", etc.
 	SessionID    string    `json:"session_id,omitempty"`   // logical session for conversation continuity
 	Model        string    `json:"model,omitempty"`        // model override for this session
-	Effort       string    `json:"effort,omitempty"`       // reasoning effort: low, medium, high, max
+	Effort       string    `json:"effort,omitempty"`       // reasoning effort: low, medium, high, xhigh, max
 	Timestamp    time.Time `json:"timestamp"`
 }
 
