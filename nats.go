@@ -133,6 +133,11 @@ func (c *Client) EnsureStreams() error {
 			MaxAge:   30 * 24 * time.Hour,
 		},
 		{
+			Name:     "BRIDGE",
+			Subjects: []string{"bridge.result"},
+			MaxAge:   30 * 24 * time.Hour,
+		},
+		{
 			Name:     "EVENTS",
 			Subjects: []string{"spawn.>", "health.>", "forge.>"},
 			MaxAge:   7 * 24 * time.Hour,
