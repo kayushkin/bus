@@ -8,12 +8,18 @@ import (
 // === chat.inbound ===
 
 // ChatInbound represents an incoming chat message arriving via bus.
+//
+// Source identifies the producer in the user's infrastructure (e.g.
+// "scheduler", "autoworker") — distinct from Channel (platform of origin) and
+// Author (who typed it). Consumers forward Source unchanged to downstream
+// session creation so sessions can be filtered/sorted by origin.
 type ChatInbound struct {
 	Text         string    `json:"text"`
 	Author       string    `json:"author,omitempty"`
 	Agent        string    `json:"agent,omitempty"`
 	Orchestrator string    `json:"orchestrator,omitempty"` // "inber", "openclaw", etc.
 	Channel      string    `json:"channel,omitempty"`      // "webchat", "discord", etc.
+	Source       string    `json:"source,omitempty"`       // producer tag: "scheduler", "autoworker", etc.
 	SessionID    string    `json:"session_id,omitempty"`   // logical session for conversation continuity
 	Model        string    `json:"model,omitempty"`        // model override for this session
 	Effort       string    `json:"effort,omitempty"`       // reasoning effort: low, medium, high, xhigh, max
